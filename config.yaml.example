@@ -1,0 +1,25 @@
+http:
+  listen: ":8080"
+
+sip:
+  transport: "tcp"
+  listen: "0.0.0.0:5060"
+  realm: "callfxo"
+  domain: "callfxo.local"
+  advertised_ip: "192.168.1.33"
+  contact_user: "callfxo"
+  nonce_ttl_hours: 1
+
+media:
+  rtp_bind_ip: "0.0.0.0"
+  public_ip: "192.168.1.33"
+  ice_stun_urls:
+    - "stun:stun.l.google.com:19302"
+
+database:
+  path: "./callfxo.db"
+
+auth:
+  cookie_name: "callfxo_session"
+  session_ttl_hours: 24
+
