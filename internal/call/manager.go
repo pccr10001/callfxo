@@ -292,6 +292,20 @@ func (m *Manager) unregister(sess *CallSession) {
 	m.mu.Unlock()
 }
 
+func (m *Manager) IsBoxInUse(boxID int64) bool {
+	if boxID <= 0 {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, cs := range m.callsByID {
+		if cs != nil && cs.BoxID == boxID {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *CallSession) AddICECandidate(candidate webrtc.ICECandidateInit) error {
 	if c.pc == nil {
 		return fmt.Errorf("peer connection not ready")

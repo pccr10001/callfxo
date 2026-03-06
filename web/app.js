@@ -253,7 +253,9 @@ function resolveInitialLang() {
     const saved = localStorage.getItem('callfxo_lang');
     if (saved) return normalizeLang(saved);
   } catch (_) {}
-  return DEFAULT_LANG;
+  const fromList = Array.isArray(navigator.languages) ? navigator.languages.find((v) => String(v || '').trim() !== '') : '';
+  const browserLang = fromList || navigator.language || navigator.userLanguage || '';
+  return browserLang ? normalizeLang(browserLang) : DEFAULT_LANG;
 }
 
 const state = {

@@ -56,6 +56,7 @@ type Registration struct {
 type FXOBoxWithStatus struct {
 	FXOBox
 	Online       bool          `json:"online"`
+	InUse        bool          `json:"in_use"`
 	Registration *Registration `json:"registration,omitempty"`
 }
 

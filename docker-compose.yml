@@ -1,0 +1,35 @@
+﻿version: "3.9"
+
+services:
+  callfxo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: callfxo
+    restart: unless-stopped
+    network_mode: host
+    command: ["-config", "/app/config.yaml"]
+
+    # Keep config and database outside the container image
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/data
+
+    environment:
+      TZ: Asia/Taipei
+
+    # Host network mode: container shares host network namespace.
+    # Keep ports/sysctls below as commented reference in case you switch
+    # back to bridge networking later.
+    # HTTP + SIP (both TCP/UDP) + RTP UDP range (bridge mode reference)
+    # ports:
+    #   - "8080:8080/tcp"
+    #   - "5060:5060/tcp"
+    #   - "5060:5060/udp"
+    #   - "12000-12100:12000-12100/udp"
+
+    # Bridge mode reference:
+    # CallFXO uses UDP listen on port 0 for RTP; this narrows ephemeral ports
+    # so they match the published RTP range above.
+    # sysctls:
+    #   net.ipv4.ip_local_port_range: "12000 12100"

@@ -1,0 +1,7 @@
+﻿<resources>
+  <string name="app_name">CallFXO</string>
+  <string name="notif_channel_call">CallFXO Calls</string>
+  <string name="notif_call_active">Call in progress</string>
+  <string name="notif_call_active_desc">Tap to return to CallFXO</string>
+  <string name="notif_call_ended">Call ended</string>
+</resources>

@@ -1,0 +1,14 @@
+﻿.git
+.gitignore
+.idea
+.vscode
+
+callfxo.db
+*.db
+config.yaml
+data/
+
+*.log
+*.tmp
+
+README.md

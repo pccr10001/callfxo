@@ -35,7 +35,7 @@ type Server struct {
 	wsClients map[*wsClient]struct{}
 
 	boxStateMu sync.Mutex
-	boxOnline  map[int64]bool
+	boxState   map[int64]boxRuntimeState
 
 	callMu    sync.RWMutex
 	userCalls map[int64]*call.CallSession
@@ -53,6 +53,11 @@ type wsMessage struct {
 type wsClient struct {
 	conn *websocket.Conn
 	mu   sync.Mutex
+}
+
+type boxRuntimeState struct {
+	Online bool
+	InUse  bool
 }
 
 func (c *wsClient) Send(v any) error {
@@ -105,10 +110,11 @@ func (s *Server) sendBoxSnapshot(c *wsClient) {
 	type boxStatus struct {
 		BoxID  int64 `json:"box_id"`
 		Online bool  `json:"online"`
+		InUse  bool  `json:"in_use"`
 	}
 	list := make([]boxStatus, 0, len(items))
 	for _, b := range items {
-		list = append(list, boxStatus{BoxID: b.ID, Online: b.Online})
+		list = append(list, boxStatus{BoxID: b.ID, Online: b.Online, InUse: s.calls.IsBoxInUse(b.ID)})
 	}
 	_ = c.Send(gin.H{"type": "boxes_snapshot", "items": list})
 }
@@ -154,7 +160,7 @@ func New(cfg config.Config, st *store.Store, authMgr *auth.Manager, calls *call.
 			},
 		},
 		wsClients: make(map[*wsClient]struct{}),
-		boxOnline: make(map[int64]bool),
+		boxState:  make(map[int64]boxRuntimeState),
 		userCalls: make(map[int64]*call.CallSession),
 	}
 }
@@ -213,14 +219,17 @@ func (s *Server) boxStatusLoop(ctx context.Context) {
 				continue
 			}
 
-			current := make(map[int64]bool, len(items))
+			current := make(map[int64]boxRuntimeState, len(items))
 			for _, b := range items {
-				current[b.ID] = b.Online
+				current[b.ID] = boxRuntimeState{
+					Online: b.Online,
+					InUse:  s.calls.IsBoxInUse(b.ID),
+				}
 			}
 
 			s.boxStateMu.Lock()
 			if first {
-				s.boxOnline = current
+				s.boxState = current
 				first = false
 				s.boxStateMu.Unlock()
 				continue
@@ -229,25 +238,28 @@ func (s *Server) boxStatusLoop(ctx context.Context) {
 			changes := make([]struct {
 				id     int64
 				online bool
+				inUse  bool
 			}, 0)
-			for id, online := range current {
-				prev, ok := s.boxOnline[id]
-				if !ok || prev != online {
+			for id, now := range current {
+				prev, ok := s.boxState[id]
+				if !ok || prev.Online != now.Online || prev.InUse != now.InUse {
 					changes = append(changes, struct {
 						id     int64
 						online bool
-					}{id: id, online: online})
+						inUse  bool
+					}{id: id, online: now.Online, inUse: now.InUse})
 				}
 			}
-			for id := range s.boxOnline {
+			for id := range s.boxState {
 				if _, ok := current[id]; !ok {
 					changes = append(changes, struct {
 						id     int64
 						online bool
-					}{id: id, online: false})
+						inUse  bool
+					}{id: id, online: false, inUse: false})
 				}
 			}
-			s.boxOnline = current
+			s.boxState = current
 			s.boxStateMu.Unlock()
 
 			for _, ch := range changes {
@@ -255,6 +267,7 @@ func (s *Server) boxStatusLoop(ctx context.Context) {
 					"type":   "box_status",
 					"box_id": ch.id,
 					"online": ch.online,
+					"in_use": ch.inUse,
 				})
 			}
 
@@ -485,6 +498,7 @@ func (s *Server) handleListFXO(c *gin.Context) {
 	}
 	for i := range items {
 		items[i].SIPPassword = ""
+		items[i].InUse = s.calls.IsBoxInUse(items[i].ID)
 	}
 	c.JSON(200, gin.H{"items": items})
 }

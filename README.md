@@ -52,6 +52,26 @@ http://<server-ip>:8080
   - first run (DB not exists): check console output for generated password
   - existing DB: use your existing admin password
 
+## Docker
+
+`Dockerfile` and `docker-compose.yml` are included.
+
+1. In `config.yaml`, set:
+  - `database.path: /data/callfxo.db`
+  - `sip.advertised_ip` and `media.public_ip` to your host/server reachable IP
+2. Start:
+
+```bash
+docker compose up -d --build
+```
+
+Exposed ports:
+- `8080/tcp` (web)
+- `5060/tcp` and `5060/udp` (SIP)
+- `12000-12100/udp` (RTP dynamic range, default compose profile)
+
+Note: compose sets `net.ipv4.ip_local_port_range=12000 12100` so RTP ephemeral ports stay inside mapped UDP range.
+
 ## Default Bootstrap Account
 
 When the database file does not exist (first run), the server auto-generates:
