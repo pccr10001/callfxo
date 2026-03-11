@@ -60,6 +60,13 @@ type FXOBoxWithStatus struct {
 	Registration *Registration `json:"registration,omitempty"`
 }
 
+type FXOBoxForUser struct {
+	FXOBoxWithStatus
+	CanDial        bool `json:"can_dial"`
+	CanReceive     bool `json:"can_receive"`
+	NotifyIncoming bool `json:"notify_incoming"`
+}
+
 type CallLog struct {
 	ID         int64      `json:"id"`
 	UserID     int64      `json:"user_id"`
@@ -80,12 +87,39 @@ type Contact struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type UserDevice struct {
+	DeviceToken      string    `json:"device_token"`
+	UserID           int64     `json:"user_id"`
+	ClientType       string    `json:"client_type"`
+	DeviceName       string    `json:"device_name"`
+	PushPlatform     string    `json:"push_platform"`
+	PushToken        string    `json:"push_token,omitempty"`
+	RefreshTokenHash string    `json:"-"`
+	RefreshExpiresAt time.Time `json:"refresh_expires_at"`
+	LastSeenAt       time.Time `json:"last_seen_at"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type UserFXOPermission struct {
+	UserID         int64     `json:"user_id"`
+	FXOBoxID       int64     `json:"fxo_box_id"`
+	CanDial        bool      `json:"can_dial"`
+	CanReceive     bool      `json:"can_receive"`
+	NotifyIncoming bool      `json:"notify_incoming"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("enable foreign_keys: %w", err)
+	}
 	if err := pingWithTimeout(db); err != nil {
 		return nil, err
 	}
@@ -164,9 +198,37 @@ func (s *Store) migrate() error {
 			value TEXT NOT NULL,
 			updated_at INTEGER NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS user_devices (
+			device_token TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL,
+			client_type TEXT NOT NULL,
+			device_name TEXT NOT NULL,
+			push_platform TEXT NOT NULL DEFAULT '',
+			push_token TEXT NOT NULL DEFAULT '',
+			refresh_token_hash TEXT NOT NULL DEFAULT '',
+			refresh_expires_at INTEGER NOT NULL DEFAULT 0,
+			last_seen_at INTEGER NOT NULL,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+		);`,
+		`CREATE TABLE IF NOT EXISTS user_fxo_permissions (
+			user_id INTEGER NOT NULL,
+			fxo_box_id INTEGER NOT NULL,
+			can_dial INTEGER NOT NULL DEFAULT 0,
+			can_receive INTEGER NOT NULL DEFAULT 0,
+			notify_incoming INTEGER NOT NULL DEFAULT 1,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY(user_id, fxo_box_id),
+			FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+			FOREIGN KEY(fxo_box_id) REFERENCES fxo_boxes(id) ON DELETE CASCADE
+		);`,
 		`CREATE INDEX IF NOT EXISTS idx_contacts_user_id ON contacts(user_id, id DESC);`,
 		`CREATE INDEX IF NOT EXISTS idx_contacts_user_id_name ON contacts(user_id, name COLLATE NOCASE);`,
 		`CREATE INDEX IF NOT EXISTS idx_contacts_user_id_number ON contacts(user_id, number COLLATE NOCASE);`,
+		`CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id, updated_at DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_user_devices_push ON user_devices(push_token);`,
+		`CREATE INDEX IF NOT EXISTS idx_user_fxo_permissions_box ON user_fxo_permissions(fxo_box_id, user_id);`,
 	}
 
 	for _, q := range queries {
@@ -175,6 +237,9 @@ func (s *Store) migrate() error {
 		}
 	}
 	if err := s.ensureUserRoleColumn(); err != nil {
+		return err
+	}
+	if err := s.ensureUserFxoNotifyIncomingColumn(); err != nil {
 		return err
 	}
 	if err := s.ensureCallLogUserColumn(); err != nil {
@@ -254,6 +319,41 @@ func (s *Store) ensureCallLogUserColumn() error {
 	if !hasUserID {
 		if _, err := s.db.Exec(`ALTER TABLE call_logs ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("add call_logs.user_id column: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureUserFxoNotifyIncomingColumn() error {
+	rows, err := s.db.Query(`PRAGMA table_info(user_fxo_permissions)`)
+	if err != nil {
+		return fmt.Errorf("query user_fxo_permissions table_info: %w", err)
+	}
+	defer rows.Close()
+
+	hasNotify := false
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			typ       string
+			notnull   int
+			dfltValue any
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dfltValue, &pk); err != nil {
+			return fmt.Errorf("scan user_fxo_permissions table_info: %w", err)
+		}
+		if strings.EqualFold(name, "notify_incoming") {
+			hasNotify = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate user_fxo_permissions table_info: %w", err)
+	}
+	if !hasNotify {
+		if _, err := s.db.Exec(`ALTER TABLE user_fxo_permissions ADD COLUMN notify_incoming INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return fmt.Errorf("add user_fxo_permissions.notify_incoming column: %w", err)
 		}
 	}
 	return nil
@@ -506,8 +606,7 @@ func (s *Store) GetFXOBoxBySIPUsername(ctx context.Context, username string) (FX
 }
 
 func (s *Store) ListFXOBoxesWithStatus(ctx context.Context) ([]FXOBoxWithStatus, error) {
-	now := time.Now().Unix()
-	rows, err := s.db.QueryContext(ctx, `
+	return s.listFXOBoxesWithStatus(ctx, `
 		SELECT
 			b.id, b.name, b.sip_username, b.sip_password, b.created_at,
 			r.contact_uri, r.source_addr, r.transport, r.call_id, r.user_agent,
@@ -515,6 +614,87 @@ func (s *Store) ListFXOBoxesWithStatus(ctx context.Context) ([]FXOBoxWithStatus,
 		FROM fxo_boxes b
 		LEFT JOIN fxo_registrations r ON r.fxo_box_id = b.id
 		ORDER BY b.id ASC`)
+}
+
+func (s *Store) ListFXOBoxesWithStatusForUser(ctx context.Context, userID int64, includeAll bool) ([]FXOBoxForUser, error) {
+	query := `
+		SELECT
+			b.id, b.name, b.sip_username, b.sip_password, b.created_at,
+			r.contact_uri, r.source_addr, r.transport, r.call_id, r.user_agent,
+			r.expires_at, r.updated_at,
+			p.can_dial, p.can_receive, p.notify_incoming
+		FROM fxo_boxes b
+		LEFT JOIN user_fxo_permissions p ON p.fxo_box_id = b.id AND p.user_id = ?
+		LEFT JOIN fxo_registrations r ON r.fxo_box_id = b.id
+	`
+	if !includeAll {
+		query += ` WHERE p.can_dial = 1`
+	}
+	query += ` ORDER BY b.id ASC`
+
+	now := time.Now().Unix()
+	rows, err := s.db.QueryContext(ctx, query, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list fxo boxes for user: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]FXOBoxForUser, 0)
+	for rows.Next() {
+		var item FXOBoxForUser
+		var rContactURI, rSourceAddr, rTransport, rCallID, rUserAgent sql.NullString
+		var rExpiresAt, rUpdatedAt sql.NullInt64
+		var created int64
+		var canDial, canReceive, notifyIncoming sql.NullInt64
+
+		if err := rows.Scan(
+			&item.ID, &item.Name, &item.SIPUsername, &item.SIPPassword, &created,
+			&rContactURI, &rSourceAddr, &rTransport, &rCallID, &rUserAgent,
+			&rExpiresAt, &rUpdatedAt,
+			&canDial, &canReceive, &notifyIncoming,
+		); err != nil {
+			return nil, fmt.Errorf("scan fxo box for user: %w", err)
+		}
+		item.CreatedAt = time.Unix(created, 0)
+		if includeAll {
+			item.CanDial = true
+			item.CanReceive = true
+			// for notify_incoming, we default to 1 if null, else use the explicit preference
+			if notifyIncoming.Valid {
+				item.NotifyIncoming = notifyIncoming.Int64 != 0
+			} else {
+				item.NotifyIncoming = true
+			}
+		} else {
+			item.CanDial = canDial.Valid && canDial.Int64 != 0
+			item.CanReceive = canReceive.Valid && canReceive.Int64 != 0
+			item.NotifyIncoming = notifyIncoming.Valid && notifyIncoming.Int64 != 0
+		}
+
+		if rContactURI.Valid {
+			item.Registration = &Registration{
+				FXOBoxID:   item.ID,
+				ContactURI: rContactURI.String,
+				SourceAddr: rSourceAddr.String,
+				Transport:  rTransport.String,
+				CallID:     rCallID.String,
+				UserAgent:  rUserAgent.String,
+				ExpiresAt:  time.Unix(rExpiresAt.Int64, 0),
+				UpdatedAt:  time.Unix(rUpdatedAt.Int64, 0),
+			}
+			item.Online = item.Registration.ExpiresAt.After(time.Unix(now, 0))
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate fxo boxes for user: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) listFXOBoxesWithStatus(ctx context.Context, query string, args ...any) ([]FXOBoxWithStatus, error) {
+	now := time.Now().Unix()
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list fxo boxes: %w", err)
 	}
@@ -773,6 +953,288 @@ func (s *Store) ListContacts(ctx context.Context, userID int64, q string, limit 
 		return nil, fmt.Errorf("iterate contacts: %w", err)
 	}
 	return out, nil
+}
+
+func (s *Store) UpsertUserDevice(ctx context.Context, dev UserDevice) error {
+	now := time.Now()
+	createdAt := now.Unix()
+	if !dev.CreatedAt.IsZero() {
+		createdAt = dev.CreatedAt.Unix()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO user_devices
+			(device_token, user_id, client_type, device_name, push_platform, push_token, refresh_token_hash, refresh_expires_at, last_seen_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(device_token) DO UPDATE SET
+			user_id = excluded.user_id,
+			client_type = excluded.client_type,
+			device_name = excluded.device_name,
+			push_platform = CASE WHEN excluded.push_platform <> '' THEN excluded.push_platform ELSE user_devices.push_platform END,
+			push_token = CASE WHEN excluded.push_token <> '' THEN excluded.push_token ELSE user_devices.push_token END,
+			refresh_token_hash = excluded.refresh_token_hash,
+			refresh_expires_at = excluded.refresh_expires_at,
+			last_seen_at = excluded.last_seen_at,
+			updated_at = excluded.updated_at
+	`, strings.TrimSpace(dev.DeviceToken), dev.UserID, strings.TrimSpace(dev.ClientType), strings.TrimSpace(dev.DeviceName),
+		strings.TrimSpace(dev.PushPlatform), strings.TrimSpace(dev.PushToken), strings.TrimSpace(dev.RefreshTokenHash),
+		dev.RefreshExpiresAt.Unix(), now.Unix(), createdAt, now.Unix())
+	if err != nil {
+		return fmt.Errorf("upsert user device: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetUserDeviceByToken(ctx context.Context, deviceToken string) (UserDevice, error) {
+	var dev UserDevice
+	var refreshExpiresAt, lastSeenAt, createdAt, updatedAt int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT device_token, user_id, client_type, device_name, push_platform, push_token, refresh_token_hash,
+			refresh_expires_at, last_seen_at, created_at, updated_at
+		FROM user_devices
+		WHERE device_token = ?`, strings.TrimSpace(deviceToken),
+	).Scan(&dev.DeviceToken, &dev.UserID, &dev.ClientType, &dev.DeviceName, &dev.PushPlatform, &dev.PushToken,
+		&dev.RefreshTokenHash, &refreshExpiresAt, &lastSeenAt, &createdAt, &updatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return UserDevice{}, ErrNotFound
+		}
+		return UserDevice{}, fmt.Errorf("get user device: %w", err)
+	}
+	dev.RefreshExpiresAt = time.Unix(refreshExpiresAt, 0)
+	dev.LastSeenAt = time.Unix(lastSeenAt, 0)
+	dev.CreatedAt = time.Unix(createdAt, 0)
+	dev.UpdatedAt = time.Unix(updatedAt, 0)
+	return dev, nil
+}
+
+func (s *Store) TouchUserDevice(ctx context.Context, userID int64, deviceToken string) error {
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE user_devices
+		SET last_seen_at = ?, updated_at = ?
+		WHERE user_id = ? AND device_token = ?`, now, now, userID, strings.TrimSpace(deviceToken))
+	if err != nil {
+		return fmt.Errorf("touch user device: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) UpdateUserDevicePush(ctx context.Context, userID int64, deviceToken, pushPlatform, pushToken string) error {
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE user_devices
+		SET push_platform = ?, push_token = ?, last_seen_at = ?, updated_at = ?
+		WHERE user_id = ? AND device_token = ?`,
+		strings.TrimSpace(pushPlatform), strings.TrimSpace(pushToken), now, now, userID, strings.TrimSpace(deviceToken))
+	if err != nil {
+		return fmt.Errorf("update user device push: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) ClearUserDeviceAuth(ctx context.Context, userID int64, deviceToken string) error {
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE user_devices
+		SET refresh_token_hash = '', refresh_expires_at = 0, updated_at = ?
+		WHERE user_id = ? AND device_token = ?`, now, userID, strings.TrimSpace(deviceToken))
+	if err != nil {
+		return fmt.Errorf("clear user device auth: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) ClearUserDeviceAuthByUserID(ctx context.Context, userID int64) error {
+	now := time.Now().Unix()
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE user_devices
+		SET refresh_token_hash = '', refresh_expires_at = 0, updated_at = ?
+		WHERE user_id = ?`, now, userID); err != nil {
+		return fmt.Errorf("clear user auth by user id: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListUserDevicesByUserIDs(ctx context.Context, userIDs []int64) ([]UserDevice, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, 0, len(userIDs))
+	args := make([]any, 0, len(userIDs))
+	for _, id := range userIDs {
+		placeholders = append(placeholders, "?")
+		args = append(args, id)
+	}
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT device_token, user_id, client_type, device_name, push_platform, push_token, refresh_token_hash,
+			refresh_expires_at, last_seen_at, created_at, updated_at
+		FROM user_devices
+		WHERE user_id IN (%s)`, strings.Join(placeholders, ",")), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list user devices: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]UserDevice, 0)
+	for rows.Next() {
+		var dev UserDevice
+		var refreshExpiresAt, lastSeenAt, createdAt, updatedAt int64
+		if err := rows.Scan(&dev.DeviceToken, &dev.UserID, &dev.ClientType, &dev.DeviceName, &dev.PushPlatform, &dev.PushToken,
+			&dev.RefreshTokenHash, &refreshExpiresAt, &lastSeenAt, &createdAt, &updatedAt); err != nil {
+			return nil, fmt.Errorf("scan user device: %w", err)
+		}
+		dev.RefreshExpiresAt = time.Unix(refreshExpiresAt, 0)
+		dev.LastSeenAt = time.Unix(lastSeenAt, 0)
+		dev.CreatedAt = time.Unix(createdAt, 0)
+		dev.UpdatedAt = time.Unix(updatedAt, 0)
+		out = append(out, dev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate user devices: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) SetUserFXOPermission(ctx context.Context, userID, boxID int64, canDial, canReceive bool) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO user_fxo_permissions (user_id, fxo_box_id, can_dial, can_receive, notify_incoming, updated_at)
+		VALUES (?, ?, ?, ?, 1, ?)
+		ON CONFLICT(user_id, fxo_box_id) DO UPDATE SET
+			can_dial = excluded.can_dial,
+			can_receive = excluded.can_receive,
+			updated_at = excluded.updated_at
+	`, userID, boxID, boolToInt(canDial), boolToInt(canReceive), now)
+	if err != nil {
+		return fmt.Errorf("set user fxo permission: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) SetUserNotifyPreference(ctx context.Context, userID, boxID int64, notify bool) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO user_fxo_permissions (user_id, fxo_box_id, can_dial, can_receive, notify_incoming, updated_at)
+		VALUES (?, ?, 0, 0, ?, ?)
+		ON CONFLICT(user_id, fxo_box_id) DO UPDATE SET
+			notify_incoming = excluded.notify_incoming,
+			updated_at = excluded.updated_at
+	`, userID, boxID, boolToInt(notify), now)
+	if err != nil {
+		return fmt.Errorf("set notify preference: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListUserFXOPermissions(ctx context.Context) ([]UserFXOPermission, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT user_id, fxo_box_id, can_dial, can_receive, notify_incoming, updated_at
+		FROM user_fxo_permissions
+		ORDER BY user_id ASC, fxo_box_id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list user fxo permissions: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]UserFXOPermission, 0)
+	for rows.Next() {
+		var item UserFXOPermission
+		var canDial, canReceive, notifyIncoming int
+		var updatedAt int64
+		if err := rows.Scan(&item.UserID, &item.FXOBoxID, &canDial, &canReceive, &notifyIncoming, &updatedAt); err != nil {
+			return nil, fmt.Errorf("scan user fxo permission: %w", err)
+		}
+		item.CanDial = canDial != 0
+		item.CanReceive = canReceive != 0
+		item.NotifyIncoming = notifyIncoming != 0
+		item.UpdatedAt = time.Unix(updatedAt, 0)
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate user fxo permissions: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) UserCanDialFXO(ctx context.Context, userID, boxID int64, isAdmin bool) (bool, error) {
+	if isAdmin {
+		return true, nil
+	}
+	return s.userHasFXOPermission(ctx, userID, boxID, "can_dial")
+}
+
+func (s *Store) UserCanReceiveFXO(ctx context.Context, userID, boxID int64, isAdmin bool) (bool, error) {
+	if isAdmin {
+		return true, nil
+	}
+	return s.userHasFXOPermission(ctx, userID, boxID, "can_receive")
+}
+
+func (s *Store) ListUsersForIncomingFXO(ctx context.Context, boxID int64) ([]User, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT u.id, u.username, u.role, u.created_at
+		FROM users u
+		LEFT JOIN user_fxo_permissions p ON p.user_id = u.id AND p.fxo_box_id = ?
+		WHERE (u.role = 'admin' OR p.can_receive = 1)
+		  AND COALESCE(p.notify_incoming, 1) = 1
+		ORDER BY u.id ASC`, boxID)
+	if err != nil {
+		return nil, fmt.Errorf("list users for incoming fxo: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]User, 0)
+	for rows.Next() {
+		var item User
+		var createdAt int64
+		if err := rows.Scan(&item.ID, &item.Username, &item.Role, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan incoming user: %w", err)
+		}
+		item.Role = normalizeRole(item.Role)
+		item.CreatedAt = time.Unix(createdAt, 0)
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate incoming users: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) userHasFXOPermission(ctx context.Context, userID, boxID int64, field string) (bool, error) {
+	if field != "can_dial" && field != "can_receive" {
+		return false, fmt.Errorf("unsupported permission field")
+	}
+	var allowed int
+	err := s.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM user_fxo_permissions WHERE user_id = ? AND fxo_box_id = ?`, field),
+		userID, boxID,
+	).Scan(&allowed)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get user fxo permission: %w", err)
+	}
+	return allowed != 0, nil
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 func normalizeRole(role string) string {

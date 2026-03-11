@@ -20,6 +20,26 @@ database:
   path: "./callfxo.db"
 
 auth:
-  cookie_name: "callfxo_session"
-  session_ttl_hours: 24
+  # Access token used by API and WebSocket bearer auth.
+  cookie_name: "callfxo_access"
+  access_ttl_minutes: 60
+  # Refresh token lifetime for app/web session recovery.
+  refresh_ttl_hours: 720
+
+fcm:
+  # Optional. Leave disabled when you do not want Android/Web push notifications.
+  enabled: false
+  project_id: ""
+  web_app_id: ""
+  web_api_key: ""
+  android_app_id: ""
+  android_api_key: ""
+  messaging_sender_id: ""
+  auth_domain: ""
+  storage_bucket: ""
+  measurement_id: ""
+  # Required for browser push subscription.
+  vapid_key: ""
+  # Path to the Firebase service account JSON used by the server to send FCM.
+  service_account_json: ""
 

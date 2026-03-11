@@ -1,10 +1,6 @@
-﻿package li.power.app.callfxo.android
+package li.power.app.callfxo.android
 
 import android.app.Application
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.content.Context
-import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Job
@@ -13,24 +9,31 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import li.power.app.callfxo.android.call.ActiveCallInfo
 import li.power.app.callfxo.android.call.AudioOutput
-import li.power.app.callfxo.android.call.CallController
 import li.power.app.callfxo.android.call.CallGuardService
-import li.power.app.callfxo.android.data.ApiClient
+import li.power.app.callfxo.android.call.PendingIncomingCall
 import li.power.app.callfxo.android.data.CallLogDto
 import li.power.app.callfxo.android.data.ContactSource
 import li.power.app.callfxo.android.data.DeviceContactsReader
 import li.power.app.callfxo.android.data.FxoBoxDto
 import li.power.app.callfxo.android.data.PhoneContact
-import li.power.app.callfxo.android.data.SessionStore
+import li.power.app.callfxo.android.push.PushRuntime
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
-  private val sessionStore = SessionStore(app)
-  private val api = ApiClient(sessionStore)
+  private val appServices = CallFxoApp.from(app)
+  private val sessionStore = appServices.sessionStore
+  private val api = appServices.apiClient
   private val deviceContactsReader = DeviceContactsReader()
-  private val callController = CallController(app.applicationContext)
+  private val callController = appServices.callController
 
-  private val _ui = MutableStateFlow(UiState(serverAddr = sessionStore.getServerAddr()))
+  private val _ui = MutableStateFlow(
+    UiState(
+      serverAddr = sessionStore.getServerAddr(),
+      ringtoneUri = sessionStore.getRingtoneUri(),
+      ringtoneVolume = sessionStore.getRingtoneVolume(),
+    )
+  )
   val ui: StateFlow<UiState> = _ui.asStateFlow()
 
   private var deviceContacts: List<PhoneContact> = emptyList()
@@ -40,7 +43,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
   init {
     observeCallController()
     restoreSession()
-    ensureNotificationChannel()
   }
 
   private fun observeCallController() {
@@ -61,7 +63,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _ui.value = _ui.value.copy(inCall = active)
         if (active) {
           CallGuardService.start(getApplication())
-        } else {
+        } else if (!_ui.value.callBusy) {
           CallGuardService.stop(getApplication())
         }
       }
@@ -70,6 +72,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     viewModelScope.launch {
       callController.callBusy.collect { busy ->
         _ui.value = _ui.value.copy(callBusy = busy)
+        if (busy) {
+          CallGuardService.start(getApplication())
+        } else if (!_ui.value.inCall) {
+          CallGuardService.stop(getApplication())
+        }
       }
     }
 
@@ -82,6 +89,35 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     viewModelScope.launch {
       callController.bluetoothAvailable.collect { available ->
         _ui.value = _ui.value.copy(bluetoothAvailable = available)
+      }
+    }
+
+    viewModelScope.launch {
+      callController.activeCallInfo.collect { info ->
+        _ui.value = _ui.value.copy(
+          callDisplayName = info.displayName,
+          callDisplaySubtitle = info.subtitle,
+          callDirection = info.direction,
+          callConnectedAtMs = info.connectedAtMs,
+        )
+      }
+    }
+
+    viewModelScope.launch {
+      callController.currentIncoming.collect { incoming ->
+        _ui.value = _ui.value.copy(incomingCall = incoming)
+      }
+    }
+
+    viewModelScope.launch {
+      callController.muted.collect { muted ->
+        _ui.value = _ui.value.copy(muted = muted)
+      }
+    }
+
+    viewModelScope.launch {
+      callController.uiMessages.collect { message ->
+        _ui.value = _ui.value.copy(noticeMessage = message)
       }
     }
 
@@ -102,7 +138,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     viewModelScope.launch {
       api.me().onSuccess { me ->
         if (me.authenticated && me.user != null) {
-          callController.setSession(s.serverAddr, s.cookieName, s.cookieValue)
+          callController.onSessionChanged()
           _ui.value = _ui.value.copy(
             loggedIn = true,
             username = me.user.username,
@@ -110,6 +146,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             loginError = null,
           )
           refreshAll()
+          syncPushRegistration()
         } else {
           sessionStore.clearSession()
         }
@@ -136,18 +173,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     _ui.value = _ui.value.copy(passwordInput = v)
   }
 
-  fun onDialNumberChange(v: String) {
-    _ui.value = _ui.value.copy(dialNumber = v)
-  }
-
   fun onDialPadPress(d: String) {
     if (d.isBlank()) return
-    if (_ui.value.inCall) {
+    if (_ui.value.inCall || _ui.value.callBusy) {
       callController.sendDtmf(d)
       return
     }
-    if (_ui.value.callBusy) return
     _ui.value = _ui.value.copy(dialNumber = _ui.value.dialNumber + d)
+  }
+
+  fun onBackspaceDial() {
+    val current = _ui.value.dialNumber
+    if (current.isEmpty()) return
+    _ui.value = _ui.value.copy(dialNumber = current.dropLast(1))
   }
 
   fun onSelectBox(boxId: Long) {
@@ -168,10 +206,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
       _ui.value = _ui.value.copy(loading = true, loginError = null)
       api.login(server, username, password)
         .onSuccess { user ->
-          val session = api.currentSession()
-          if (session != null) {
-            callController.setSession(session.serverAddr, session.cookieName, session.cookieValue)
-          }
+          callController.onSessionChanged()
           _ui.value = _ui.value.copy(
             loggedIn = true,
             role = user.role,
@@ -181,6 +216,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             loading = false,
           )
           refreshAll()
+          syncPushRegistration()
         }
         .onFailure { e ->
           _ui.value = _ui.value.copy(loading = false, loginError = e.message ?: "login failed")
@@ -194,7 +230,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
       api.logout()
       callController.clearSession()
       CallGuardService.stop(getApplication())
-      _ui.value = UiState(serverAddr = sessionStore.getServerAddr())
+      _ui.value = UiState(
+        serverAddr = sessionStore.getServerAddr(),
+        ringtoneUri = sessionStore.getRingtoneUri(),
+        ringtoneVolume = sessionStore.getRingtoneVolume(),
+      )
       deviceContacts = emptyList()
       serverContacts = emptyList()
     }
@@ -209,6 +249,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     refreshBoxes()
     refreshContacts(_ui.value.search)
     refreshCallLogs(_ui.value.logPage)
+    viewModelScope.launch {
+      callController.syncIncomingSnapshot()
+    }
   }
 
   fun refreshBoxes() {
@@ -318,42 +361,61 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     viewModelScope.launch {
-      runCatching { callController.dial(boxId, num) }
+      runCatching { callController.startOutgoing(boxId, num, box.name) }
         .onFailure { e -> _ui.value = _ui.value.copy(callStatus = e.message ?: "dial failed") }
     }
+  }
+
+  fun acceptIncoming() {
+    viewModelScope.launch {
+      runCatching { callController.acceptIncoming(_ui.value.incomingCall?.inviteId) }
+        .onFailure { e -> _ui.value = _ui.value.copy(callStatus = e.message ?: "accept failed") }
+    }
+  }
+
+  fun rejectIncoming() {
+    callController.rejectIncoming(_ui.value.incomingCall?.inviteId)
   }
 
   fun hangup() {
     callController.hangup()
   }
 
-  fun sendDtmf(d: String) {
-    callController.sendDtmf(d)
+  fun toggleMute() {
+    callController.setMuted(!_ui.value.muted)
   }
 
   fun setAudioOutput(output: AudioOutput) {
     callController.setAudioOutput(output)
   }
 
-  private fun ensureNotificationChannel() {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-    val nm = getApplication<Application>().getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-    val ch = NotificationChannel(
-      EVENT_CHANNEL,
-      getApplication<Application>().getString(R.string.notif_channel_call),
-      NotificationManager.IMPORTANCE_DEFAULT
-    )
-    nm.createNotificationChannel(ch)
+  fun clearNotice() {
+    _ui.value = _ui.value.copy(noticeMessage = null)
+  }
+
+  fun setRingtoneVolume(volume: Float) {
+    val normalized = volume.coerceIn(0f, 1f)
+    sessionStore.saveRingtoneVolume(normalized)
+    _ui.value = _ui.value.copy(ringtoneVolume = normalized)
+  }
+
+  fun setRingtoneUri(uri: String?) {
+    sessionStore.saveRingtoneUri(uri)
+    _ui.value = _ui.value.copy(ringtoneUri = sessionStore.getRingtoneUri())
+  }
+
+  private fun syncPushRegistration() {
+    viewModelScope.launch {
+      api.getPushConfig().onSuccess { cfg ->
+        sessionStore.savePushConfig(cfg)
+      }
+      PushRuntime.syncToken(getApplication(), sessionStore, api).onFailure { }
+    }
   }
 
   override fun onCleared() {
     super.onCleared()
     searchJob?.cancel()
-    callController.shutdown()
-  }
-
-  companion object {
-    private const val EVENT_CHANNEL = "callfxo_event"
   }
 }
 
@@ -376,6 +438,17 @@ data class UiState(
   val callBusy: Boolean = false,
   val audioOutput: AudioOutput = AudioOutput.EARPIECE,
   val bluetoothAvailable: Boolean = false,
+  val muted: Boolean = false,
+
+  val callDisplayName: String = "",
+  val callDisplaySubtitle: String = "",
+  val callDirection: String = "",
+  val callConnectedAtMs: Long = 0L,
+  val incomingCall: PendingIncomingCall? = null,
+  val noticeMessage: String? = null,
+
+  val ringtoneUri: String = "",
+  val ringtoneVolume: Float = 0.85f,
 
   val search: String = "",
   val contacts: List<PhoneContact> = emptyList(),

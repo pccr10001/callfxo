@@ -13,6 +13,7 @@ type Config struct {
 	Media     MediaConfig     `yaml:"media"`
 	Database  DatabaseConfig  `yaml:"database"`
 	Auth      AuthConfig      `yaml:"auth"`
+	FCM       FCMConfig       `yaml:"fcm"`
 	Bootstrap BootstrapConfig `yaml:"bootstrap"`
 }
 
@@ -41,9 +42,26 @@ type DatabaseConfig struct {
 }
 
 type AuthConfig struct {
-	CookieName      string `yaml:"cookie_name"`
-	SessionSecret   string `yaml:"session_secret"`
-	SessionTTLHours int    `yaml:"session_ttl_hours"`
+	CookieName       string `yaml:"cookie_name"`
+	SessionSecret    string `yaml:"session_secret"`
+	AccessTTLMinutes int    `yaml:"access_ttl_minutes"`
+	RefreshTTLHours  int    `yaml:"refresh_ttl_hours"`
+	LegacySessionTTL int    `yaml:"session_ttl_hours"`
+}
+
+type FCMConfig struct {
+	Enabled            bool   `yaml:"enabled"`
+	ProjectID          string `yaml:"project_id"`
+	WebAppID           string `yaml:"web_app_id"`
+	WebAPIKey          string `yaml:"web_api_key"`
+	AndroidAppID       string `yaml:"android_app_id"`
+	AndroidAPIKey      string `yaml:"android_api_key"`
+	MessagingSenderID  string `yaml:"messaging_sender_id"`
+	AuthDomain         string `yaml:"auth_domain"`
+	StorageBucket      string `yaml:"storage_bucket"`
+	MeasurementID      string `yaml:"measurement_id"`
+	VAPIDKey           string `yaml:"vapid_key"`
+	ServiceAccountJSON string `yaml:"service_account_json"`
 }
 
 type BootstrapConfig struct {
@@ -70,9 +88,25 @@ func Default() Config {
 		},
 		Database: DatabaseConfig{Path: "./callfxo.db"},
 		Auth: AuthConfig{
-			CookieName:      "callfxo_session",
-			SessionSecret:   "change-me-very-long-random-string",
-			SessionTTLHours: 24,
+			CookieName:       "callfxo_access",
+			SessionSecret:    "change-me-very-long-random-string",
+			AccessTTLMinutes: 60,
+			RefreshTTLHours:  24 * 30,
+			LegacySessionTTL: 24,
+		},
+		FCM: FCMConfig{
+			Enabled:            false,
+			ProjectID:          "",
+			WebAppID:           "",
+			WebAPIKey:          "",
+			AndroidAppID:       "",
+			AndroidAPIKey:      "",
+			MessagingSenderID:  "",
+			AuthDomain:         "",
+			StorageBucket:      "",
+			MeasurementID:      "",
+			VAPIDKey:           "",
+			ServiceAccountJSON: "",
 		},
 		Bootstrap: BootstrapConfig{
 			AdminUsername: "admin",
@@ -114,6 +148,16 @@ func Load(path string) (Config, error) {
 	cfg := Default()
 	if err := yaml.Unmarshal(b, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config yaml: %w", err)
+	}
+	if cfg.Auth.AccessTTLMinutes <= 0 {
+		if cfg.Auth.LegacySessionTTL > 0 {
+			cfg.Auth.AccessTTLMinutes = cfg.Auth.LegacySessionTTL * 60
+		} else {
+			cfg.Auth.AccessTTLMinutes = Default().Auth.AccessTTLMinutes
+		}
+	}
+	if cfg.Auth.RefreshTTLHours <= 0 {
+		cfg.Auth.RefreshTTLHours = Default().Auth.RefreshTTLHours
 	}
 	return cfg, nil
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/pccr10001/callfxo/internal/auth"
 	"github.com/pccr10001/callfxo/internal/call"
 	"github.com/pccr10001/callfxo/internal/config"
+	"github.com/pccr10001/callfxo/internal/push"
 	"github.com/pccr10001/callfxo/internal/sipx"
 	"github.com/pccr10001/callfxo/internal/store"
 	"github.com/pccr10001/callfxo/internal/web"
@@ -73,7 +74,8 @@ func main() {
 		logger.Info("generated bootstrap admin password", "username", adminUser, "password", adminPwd)
 	}
 
-	authMgr := auth.NewManager(secret, time.Duration(cfg.Auth.SessionTTLHours)*time.Hour)
+	authMgr := auth.NewManager(secret, time.Duration(cfg.Auth.AccessTTLMinutes)*time.Minute)
+	pushSvc := push.New(cfg.FCM)
 	sipSvc, err := sipx.New(cfg.SIP, st, logger)
 	if err != nil {
 		logger.Error("create sip service failed", "error", err)
@@ -87,7 +89,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	webServer := web.New(cfg, st, authMgr, callMgr, logger)
+	webServer := web.New(cfg, st, authMgr, callMgr, pushSvc, logger)
+	callMgr.SetNotifier(webServer)
 	router := webServer.Router()
 	httpSrv := &http.Server{Addr: cfg.HTTP.Listen, Handler: router}
 

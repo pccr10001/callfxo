@@ -1,9 +1,18 @@
-﻿package li.power.app.callfxo.android.call
+package li.power.app.callfxo.android.call
 
 import android.content.Context
+import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.media.MediaPlayer
+import android.media.RingtoneManager
+import android.net.Uri
 import android.os.Build
+import android.telecom.DisconnectCause
+import android.util.Log
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -17,6 +26,18 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import li.power.app.callfxo.android.data.ApiClient
+import li.power.app.callfxo.android.data.IncomingCallDto
+import li.power.app.callfxo.android.data.SessionStore
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import org.json.JSONObject
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
@@ -32,16 +53,6 @@ import org.webrtc.RtpReceiver
 import org.webrtc.RtpTransceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
-import kotlinx.coroutines.suspendCancellableCoroutine
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 enum class AudioOutput {
   EARPIECE,
@@ -49,18 +60,24 @@ enum class AudioOutput {
   BLUETOOTH,
 }
 
-class CallController(private val context: Context) {
+class CallController(
+  private val context: Context,
+  private val sessionStore: SessionStore,
+  private val apiClient: ApiClient,
+  private val notificationManager: CallNotificationManager,
+) {
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+  private val refreshMutex = Mutex()
 
   private val wsClient = OkHttpClient.Builder()
     .pingInterval(25, TimeUnit.SECONDS)
     .build()
 
-  private var session: SessionAuth? = null
   private var webSocket: WebSocket? = null
   private var reconnectJob: Job? = null
   private var iceDisconnectJob: Job? = null
+  private var ringtonePlayer: MediaPlayer? = null
 
   private var appForeground = false
   private var callActive = false
@@ -71,6 +88,7 @@ class CallController(private val context: Context) {
   private var audioSource: AudioSource? = null
   private var audioTrack: AudioTrack? = null
   private var endingCall = false
+  private var outgoingSignalStarted = false
   private var audioConfigured = false
   private var prevAudioMode = AudioManager.MODE_NORMAL
   private var prevSpeaker = true
@@ -95,24 +113,51 @@ class CallController(private val context: Context) {
   private val _bluetoothAvailable = MutableStateFlow(false)
   val bluetoothAvailable: StateFlow<Boolean> = _bluetoothAvailable.asStateFlow()
 
-  private val _events = MutableSharedFlow<String>(extraBufferCapacity = 16)
+  private val _events = MutableSharedFlow<String>(extraBufferCapacity = 32)
   val events: SharedFlow<String> = _events.asSharedFlow()
 
-  init {
-    refreshBluetoothAvailability()
-  }
+  private val _pendingIncoming = MutableStateFlow<List<PendingIncomingCall>>(emptyList())
+  val pendingIncoming: StateFlow<List<PendingIncomingCall>> = _pendingIncoming.asStateFlow()
 
-  fun setSession(serverAddr: String, cookieName: String, cookieValue: String) {
-    session = SessionAuth(serverAddr, cookieName, cookieValue)
+  private val _currentIncoming = MutableStateFlow<PendingIncomingCall?>(null)
+  val currentIncoming: StateFlow<PendingIncomingCall?> = _currentIncoming.asStateFlow()
+
+  private val _activeCallInfo = MutableStateFlow(ActiveCallInfo())
+  val activeCallInfo: StateFlow<ActiveCallInfo> = _activeCallInfo.asStateFlow()
+
+  private val _muted = MutableStateFlow(false)
+  val muted: StateFlow<Boolean> = _muted.asStateFlow()
+
+  private val _uiMessages = MutableSharedFlow<String>(extraBufferCapacity = 16)
+  val uiMessages: SharedFlow<String> = _uiMessages.asSharedFlow()
+
+  init {
+    notificationManager.ensureChannels()
+    CallTelecomManager.register(context)
+    refreshBluetoothAvailability()
     evaluateConnectionPolicy()
   }
 
+  fun onSessionChanged() {
+    evaluateConnectionPolicy()
+    scope.launch {
+      syncIncomingSnapshot()
+    }
+  }
+
   fun clearSession() {
-    session = null
+    stopRinging()
+    notificationManager.cancelIncomingCall()
+    CallTelecomManager.clearDisconnected()
     callActive = false
+    outgoingSignalStarted = false
+    _pendingIncoming.value = emptyList()
+    _currentIncoming.value = null
     _inCall.value = false
     _callBusy.value = false
     _callStatus.value = "idle"
+    _activeCallInfo.value = ActiveCallInfo()
+    _muted.value = false
     closePeer()
     configureAudioForCall(false)
     refreshBluetoothAvailability()
@@ -127,44 +172,98 @@ class CallController(private val context: Context) {
 
   fun shutdown() {
     clearSession()
-    try { factory?.dispose() } catch (_: Exception) {}
+    try {
+      factory?.dispose()
+    } catch (_: Exception) {
+    }
     factory = null
     scope.coroutineContext.cancel()
   }
 
-  suspend fun dial(boxId: Long, number: String) {
+  suspend fun startOutgoing(boxId: Long, number: String, boxLabel: String) {
+    val request = OutgoingCallRequest(
+      boxId = boxId,
+      boxName = boxLabel.trim(),
+      number = number.trim(),
+    )
+    try {
+      prepareOutgoingState(request)
+      if (CallTelecomManager.startOutgoing(context, request)) {
+        CallTelecomManager.markDialing()
+        return
+      }
+      performOutgoingDial(request)
+    } catch (e: Exception) {
+      if (hasOngoingCall()) {
+        endCall(
+          reason = e.message ?: "dial failed",
+          showEndedNotification = false,
+          disconnectCause = DisconnectCause.ERROR,
+        )
+      }
+      throw e
+    }
+  }
+
+  suspend fun acceptIncoming(inviteId: String? = null) {
+    val incoming = findIncoming(inviteId) ?: error("incoming call not found")
     val ws = ensureSocketReady() ?: error("websocket not connected")
     if (peerConnection != null) error("call already active")
 
     callActive = true
     _callBusy.value = true
+    _inCall.value = false
+    _callStatus.value = "connecting"
+    _activeCallInfo.value = ActiveCallInfo(
+      displayName = displayCaller(incoming),
+      subtitle = incoming.boxName,
+      direction = "incoming",
+      connectedAtMs = 0L,
+    )
     configureAudioForCall(true)
+    setMuted(false)
+    stopRinging()
+    notificationManager.cancelIncomingCall()
+
     val offerSdp = try {
       createOfferSdp()
     } catch (e: Exception) {
       callActive = false
       _callBusy.value = false
+      _activeCallInfo.value = ActiveCallInfo()
       configureAudioForCall(false)
       throw e
     }
-    _callStatus.value = "dialing"
 
     val payload = JSONObject()
-      .put("type", "dial")
-      .put("box_id", boxId)
-      .put("number", number)
+      .put("type", "incoming_accept")
+      .put("invite_id", incoming.inviteId)
       .put("sdp", offerSdp)
     ws.send(payload.toString())
   }
 
+  fun rejectIncoming(inviteId: String? = null) {
+    scope.launch {
+      rejectIncomingInternal(inviteId)
+    }
+  }
+
   fun hangup() {
     webSocket?.send(JSONObject().put("type", "hangup").toString())
-    endCall("hangup")
+    endCall("hangup", showEndedNotification = false, disconnectCause = DisconnectCause.LOCAL)
   }
 
   fun sendDtmf(digits: String) {
     if (digits.isBlank()) return
     webSocket?.send(JSONObject().put("type", "dtmf").put("digits", digits).toString())
+  }
+
+  fun setMuted(muted: Boolean) {
+    _muted.value = muted
+    try {
+      audioTrack?.setEnabled(!muted)
+    } catch (_: Exception) {
+    }
   }
 
   fun setAudioOutput(output: AudioOutput) {
@@ -177,6 +276,99 @@ class CallController(private val context: Context) {
     }
   }
 
+  fun handlePushPayload(data: Map<String, String>) {
+    when (data["event"]?.trim()) {
+      "incoming_call" -> {
+        val inviteId = data["invite_id"]?.trim().orEmpty()
+        if (inviteId.isBlank()) return
+        upsertIncoming(
+          PendingIncomingCall(
+            inviteId = inviteId,
+            boxId = data["box_id"]?.toLongOrNull() ?: 0L,
+            boxName = data["box_name"].orEmpty(),
+            callerId = data["caller_id"].orEmpty(),
+            remoteNumber = data["remote_number"].orEmpty(),
+            state = "ringing",
+          )
+        )
+        // syncIncomingSnapshot in the background shouldn't automatically wipe local Push events
+        // especially if database hasn't updated or if permissions are delayed.
+        // We skip aggressive syncing here.
+      }
+      "incoming_answered" -> {
+        val inviteId = data["invite_id"]?.trim().orEmpty()
+        val answeredBy = data["answered_by_device_id"]?.trim().orEmpty()
+        if (inviteId.isNotBlank()) {
+          removeIncoming(inviteId)
+        }
+        val currentDevice = sessionStore.getSession()?.deviceToken.orEmpty()
+        if (answeredBy.isNotBlank() && answeredBy != currentDevice) {
+          _uiMessages.tryEmit("Incoming call answered on another device")
+        }
+      }
+      "incoming_stop" -> {
+        val inviteId = data["invite_id"]?.trim().orEmpty()
+        if (inviteId.isNotBlank()) {
+          removeIncoming(inviteId)
+        }
+      }
+    }
+  }
+
+  fun handleNotificationAction(action: String?, inviteId: String, onDone: () -> Unit) {
+    scope.launch {
+      try {
+        when (action) {
+          CallNotificationManager.ACTION_ACCEPT -> acceptIncoming(inviteId)
+          CallNotificationManager.ACTION_REJECT -> rejectIncomingInternal(inviteId)
+        }
+      } catch (e: Exception) {
+        _uiMessages.tryEmit(e.message ?: "notification action failed")
+      } finally {
+        onDone()
+      }
+    }
+  }
+
+  fun answerFromTelecom(inviteId: String) {
+    scope.launch {
+      runCatching { acceptIncoming(inviteId) }
+    }
+  }
+
+  fun rejectFromTelecom(inviteId: String) {
+    rejectIncoming(inviteId)
+  }
+
+  fun startOutgoingFromTelecom(request: OutgoingCallRequest) {
+    scope.launch {
+      runCatching {
+        prepareOutgoingState(request)
+        performOutgoingDial(request)
+      }.onFailure { err ->
+        endCall(err.message ?: "dial failed", disconnectCause = DisconnectCause.ERROR)
+      }
+    }
+  }
+
+  suspend fun syncIncomingSnapshot() {
+    apiClient.listIncomingCalls()
+      .onSuccess { items ->
+        replaceIncoming(items.map(::toPendingIncoming))
+      }
+  }
+
+  private suspend fun rejectIncomingInternal(inviteId: String? = null) {
+    val incoming = findIncoming(inviteId) ?: return
+    ensureSocketReady()?.send(
+      JSONObject()
+        .put("type", "incoming_reject")
+        .put("invite_id", incoming.inviteId)
+        .toString()
+    )
+    removeIncoming(incoming.inviteId)
+  }
+
   private fun evaluateConnectionPolicy() {
     if (shouldConnect()) {
       connectSocket()
@@ -185,20 +377,22 @@ class CallController(private val context: Context) {
     }
   }
 
-  private fun shouldConnect(): Boolean = session != null && (appForeground || callActive)
+  private fun shouldConnect(): Boolean {
+    return sessionStore.getSession() != null && (appForeground || callActive || _pendingIncoming.value.isNotEmpty())
+  }
 
   private fun connectSocket() {
     if (webSocket != null) return
-    val s = session ?: return
+    val session = sessionStore.getSession() ?: return
 
-    val wsUrl = buildWebSocketUrl(s.serverAddr) ?: run {
+    val wsUrl = buildWebSocketUrl(session.serverAddr) ?: run {
       _callStatus.value = "invalid server address"
       return
     }
 
     val req = Request.Builder()
       .url(wsUrl)
-      .header("Cookie", "${s.cookieName}=${s.cookieValue}")
+      .header("Authorization", "Bearer ${session.accessToken}")
       .build()
 
     webSocket = wsClient.newWebSocket(req, object : WebSocketListener() {
@@ -207,6 +401,9 @@ class CallController(private val context: Context) {
         reconnectJob = null
         _wsConnected.value = true
         _callStatus.value = if (callActive) _callStatus.value else "connected"
+        scope.launch {
+          syncIncomingSnapshot()
+        }
       }
 
       override fun onMessage(webSocket: WebSocket, text: String) {
@@ -218,14 +415,14 @@ class CallController(private val context: Context) {
         this@CallController.webSocket = null
         _wsConnected.value = false
         if (callActive) _callStatus.value = "signaling disconnected, reconnecting"
-        if (shouldConnect()) scheduleReconnect()
+        scheduleReconnect(afterRefresh = false)
       }
 
       override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
         this@CallController.webSocket = null
         _wsConnected.value = false
         if (callActive) _callStatus.value = "signaling error, reconnecting"
-        if (shouldConnect()) scheduleReconnect()
+        scheduleReconnect(afterRefresh = response?.code == 401)
       }
     })
   }
@@ -260,20 +457,38 @@ class CallController(private val context: Context) {
     return "$scheme://$host$portPart$wsPath"
   }
 
-  private fun scheduleReconnect() {
+  private fun scheduleReconnect(afterRefresh: Boolean) {
+    if (!shouldConnect()) return
     if (reconnectJob?.isActive == true) return
     reconnectJob = scope.launch {
+      if (afterRefresh) {
+        refreshSessionIfNeeded()
+      }
       delay(1200)
       if (shouldConnect()) connectSocket()
     }
   }
 
+  private suspend fun refreshSessionIfNeeded(): Boolean {
+    val session = sessionStore.getSession() ?: return false
+    return refreshMutex.withLock {
+      val current = sessionStore.getSession() ?: return@withLock false
+      if (current.accessToken != session.accessToken) {
+        return@withLock true
+      }
+      apiClient.refresh().isSuccess
+    }
+  }
+
   private suspend fun ensureSocketReady(): WebSocket? {
     connectSocket()
-    repeat(40) {
+    repeat(50) {
       val ws = webSocket
       if (ws != null && _wsConnected.value) return ws
       delay(100)
+      if (webSocket == null && shouldConnect()) {
+        connectSocket()
+      }
     }
     return null
   }
@@ -289,12 +504,18 @@ class CallController(private val context: Context) {
               val pc = peerConnection ?: return@launch
               pc.awaitSetRemote(SessionDescription(SessionDescription.Type.ANSWER, sdp))
               callActive = true
+              outgoingSignalStarted = false
               _callBusy.value = true
               _inCall.value = true
               _callStatus.value = "call active"
+              CallTelecomManager.markActive()
+              if (_activeCallInfo.value.connectedAtMs == 0L) {
+                _activeCallInfo.value = _activeCallInfo.value.copy(connectedAtMs = System.currentTimeMillis())
+              }
+              removeIncoming(msg.optString("invite_id"))
               _events.tryEmit("call_changed")
-            } catch (e: Exception) {
-              endCall("answer error")
+            } catch (_: Exception) {
+              endCall("answer error", disconnectCause = DisconnectCause.ERROR)
             }
           }
         }
@@ -304,7 +525,7 @@ class CallController(private val context: Context) {
         val cand = IceCandidate(
           c.optString("sdpMid"),
           c.optInt("sdpMLineIndex"),
-          c.optString("candidate")
+          c.optString("candidate"),
         )
         peerConnection?.addIceCandidate(cand)
       }
@@ -313,38 +534,176 @@ class CallController(private val context: Context) {
         val detail = msg.optString("detail")
         _callStatus.value = if (detail.isNotBlank()) "$st ($detail)" else st
         _events.tryEmit("call_changed")
-        if (st == "call_recovered") {
-          callActive = true
-          _callBusy.value = true
-          _inCall.value = true
-          evaluateConnectionPolicy()
-          _events.tryEmit("call_changed")
-          return
-        }
-        if (st == "idle" || st == "failed" || st == "ended") {
-          endCall(st)
-        }
-        if (st == "sip_connected") {
-          _events.tryEmit("call_changed")
+        when (st) {
+          "call_recovered" -> {
+            callActive = true
+            outgoingSignalStarted = false
+            _callBusy.value = true
+            _inCall.value = true
+            CallTelecomManager.markActive()
+            if (_activeCallInfo.value.connectedAtMs == 0L) {
+              _activeCallInfo.value = _activeCallInfo.value.copy(connectedAtMs = System.currentTimeMillis())
+            }
+            evaluateConnectionPolicy()
+          }
+          "idle", "failed", "ended" -> {
+            if (hasOngoingCall()) {
+              endCall(
+                reason = if (detail.isNotBlank()) "$st: $detail" else st,
+                showEndedNotification = st != "idle",
+                disconnectCause = disconnectCauseFor(st, detail),
+              )
+            }
+          }
         }
       }
       "hangup" -> {
-        endCall(msg.optString("reason", "hangup"))
+        val reason = msg.optString("reason", "hangup")
+        if (hasOngoingCall()) {
+          endCall(reason, disconnectCause = disconnectCauseFor(reason))
+        } else {
+          _callStatus.value = reason
+        }
         _events.tryEmit("call_changed")
+      }
+      "incoming_call" -> {
+        upsertIncoming(
+          PendingIncomingCall(
+            inviteId = msg.optString("invite_id"),
+            boxId = msg.optLong("box_id"),
+            boxName = msg.optString("box_name"),
+            callerId = msg.optString("caller_id"),
+            remoteNumber = msg.optString("remote_number"),
+            state = msg.optString("state", "ringing"),
+          )
+        )
+      }
+      "incoming_stop" -> {
+        removeIncoming(msg.optString("invite_id"))
+      }
+      "incoming_answered" -> {
+        val inviteId = msg.optString("invite_id")
+        val answeredBy = msg.optString("answered_by_device_token")
+        removeIncoming(inviteId)
+        val currentDevice = sessionStore.getSession()?.deviceToken.orEmpty()
+        if (answeredBy.isNotBlank() && answeredBy != currentDevice) {
+          _uiMessages.tryEmit("Incoming call answered on another device")
+        }
       }
       "box_status", "boxes_snapshot" -> {
         _events.tryEmit("boxes_changed")
       }
       "error" -> {
-        _callStatus.value = "error: ${msg.optString("error")}"
-        if (!_inCall.value) {
-          callActive = false
-          _callBusy.value = false
-          evaluateConnectionPolicy()
+        val errorMessage = msg.optString("error").ifBlank { "signaling error" }
+        if (hasOngoingCall()) {
+          endCall("error: $errorMessage", disconnectCause = DisconnectCause.ERROR)
+        } else {
+          _callStatus.value = "error: $errorMessage"
         }
       }
-      else -> Unit
     }
+  }
+
+  private fun upsertIncoming(incoming: PendingIncomingCall) {
+    if (incoming.inviteId.isBlank()) return
+    val mutable = _pendingIncoming.value.toMutableList()
+    val idx = mutable.indexOfFirst { it.inviteId == incoming.inviteId }
+    if (idx >= 0) {
+      mutable[idx] = incoming.copy(receivedAtMs = mutable[idx].receivedAtMs)
+    } else {
+      mutable.add(0, incoming)
+    }
+    replaceIncoming(mutable)
+  }
+
+  private fun replaceIncoming(items: List<PendingIncomingCall>) {
+    _pendingIncoming.value = items
+      .filter { it.inviteId.isNotBlank() }
+      .distinctBy { it.inviteId }
+      .sortedByDescending { it.receivedAtMs }
+    Log.i("CallController", "replaceIncoming: updated _pendingIncoming, size=${_pendingIncoming.value.size}")
+    _currentIncoming.value = _pendingIncoming.value.firstOrNull()
+    updateIncomingPresentation()
+  }
+
+  private fun removeIncoming(inviteId: String?) {
+    Log.i("CallController", "removeIncoming($inviteId) called. current list size: ${_pendingIncoming.value.size}")
+    val normalized = inviteId?.trim().orEmpty()
+    if (normalized.isBlank()) {
+      updateIncomingPresentation()
+      return
+    }
+    _pendingIncoming.value = _pendingIncoming.value.filterNot { it.inviteId == normalized }
+    Log.i("CallController", "removeIncoming($inviteId) finished. new list size: ${_pendingIncoming.value.size}")
+    _currentIncoming.value = _pendingIncoming.value.firstOrNull()
+    updateIncomingPresentation()
+  }
+
+  private fun updateIncomingPresentation() {
+    Log.i("CallController", "updateIncomingPresentation: callActive=$callActive, _currentIncoming=${_currentIncoming.value?.inviteId}")
+    if (callActive || _currentIncoming.value == null) {
+      Log.i("CallController", "updateIncomingPresentation: stopping ringing and cancelling notification.")
+      stopRinging()
+      notificationManager.cancelIncomingCall()
+      if (!callActive) {
+        CallTelecomManager.clearDisconnected()
+      }
+      evaluateConnectionPolicy()
+      return
+    }
+    Log.i("CallController", "updateIncomingPresentation: showing incoming call and starting ringing.")
+    startRinging()
+    notificationManager.showIncomingCall(_currentIncoming.value!!)
+    CallTelecomManager.reportIncoming(context, _currentIncoming.value!!)
+    evaluateConnectionPolicy()
+  }
+
+  private fun findIncoming(inviteId: String? = null): PendingIncomingCall? {
+    val normalized = inviteId?.trim().orEmpty()
+    return if (normalized.isBlank()) {
+      _currentIncoming.value
+    } else {
+      _pendingIncoming.value.firstOrNull { it.inviteId == normalized }
+    }
+  }
+
+  private fun startRinging() {
+    if (ringtonePlayer?.isPlaying == true) return
+    val uriString = sessionStore.getRingtoneUri()
+    val uri = runCatching {
+      Uri.parse(uriString)
+    }.getOrElse {
+      RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+    }
+    if (uri == null) return
+    stopRinging()
+    ringtonePlayer = runCatching {
+      MediaPlayer().apply {
+        setAudioAttributes(
+          AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+        )
+        setDataSource(context, uri)
+        isLooping = true
+        val volume = sessionStore.getRingtoneVolume()
+        setVolume(volume, volume)
+        prepare()
+        start()
+      }
+    }.getOrNull()
+  }
+
+  private fun stopRinging() {
+    val player = ringtonePlayer ?: return
+    ringtonePlayer = null
+    runCatching {
+      if (player.isPlaying) {
+        player.stop()
+      }
+    }
+    runCatching { player.release() }
   }
 
   private suspend fun createOfferSdp(): String {
@@ -370,6 +729,7 @@ class CallController(private val context: Context) {
 
     val pc = factory!!.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
       override fun onSignalingChange(newState: PeerConnection.SignalingState?) = Unit
+
       override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
         if (!callActive && peerConnection == null) return
         when (newState) {
@@ -383,7 +743,7 @@ class CallController(private val context: Context) {
             iceDisconnectJob = scope.launch {
               delay(8000)
               if (callActive) {
-                endCall("webrtc disconnected")
+                endCall("webrtc disconnected", disconnectCause = DisconnectCause.ERROR)
               }
             }
           }
@@ -391,13 +751,15 @@ class CallController(private val context: Context) {
           PeerConnection.IceConnectionState.CLOSED -> {
             iceDisconnectJob?.cancel()
             iceDisconnectJob = null
-            endCall("webrtc disconnected")
+            endCall("webrtc disconnected", disconnectCause = DisconnectCause.ERROR)
           }
           else -> Unit
         }
       }
+
       override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
       override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) = Unit
+
       override fun onIceCandidate(candidate: IceCandidate?) {
         if (candidate == null) return
         val cand = JSONObject()
@@ -406,14 +768,17 @@ class CallController(private val context: Context) {
           .put("candidate", candidate.sdp)
         webSocket?.send(JSONObject().put("type", "candidate").put("candidate", cand).toString())
       }
+
       override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) = Unit
       override fun onAddStream(stream: MediaStream?) = Unit
       override fun onRemoveStream(stream: MediaStream?) = Unit
       override fun onDataChannel(dataChannel: DataChannel?) = Unit
       override fun onRenegotiationNeeded() = Unit
+
       override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {
         receiver?.track()?.setEnabled(true)
       }
+
       override fun onTrack(transceiver: RtpTransceiver?) {
         transceiver?.receiver?.track()?.setEnabled(true)
       }
@@ -429,7 +794,9 @@ class CallController(private val context: Context) {
       optional.add(MediaConstraints.KeyValuePair("googHighpassFilter", "true"))
     }
     audioSource = factory!!.createAudioSource(constraints)
-    audioTrack = factory!!.createAudioTrack("audio0", audioSource)
+    audioTrack = factory!!.createAudioTrack("audio0", audioSource).apply {
+      setEnabled(!_muted.value)
+    }
 
     val txInit = RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
     val audioTx = pc.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO, txInit)
@@ -462,23 +829,98 @@ class CallController(private val context: Context) {
       .toList()
   }
 
-  private fun endCall(reason: String) {
+  private fun prepareOutgoingState(request: OutgoingCallRequest) {
+    if (_callBusy.value && _activeCallInfo.value.direction != "outgoing") {
+      error("call already active")
+    }
+    if (peerConnection != null && _activeCallInfo.value.direction != "outgoing") {
+      error("call already active")
+    }
+    callActive = true
+    _callBusy.value = true
+    _inCall.value = false
+    _callStatus.value = "dialing"
+    _activeCallInfo.value = ActiveCallInfo(
+      displayName = request.number,
+      subtitle = request.boxName,
+      direction = "outgoing",
+      connectedAtMs = 0L,
+    )
+    configureAudioForCall(true)
+    setMuted(false)
+    evaluateConnectionPolicy()
+  }
+
+  private suspend fun performOutgoingDial(request: OutgoingCallRequest) {
+    if (outgoingSignalStarted) return
+    outgoingSignalStarted = true
+    try {
+      val ws = ensureSocketReady() ?: error("websocket not connected")
+      val offerSdp = createOfferSdp()
+      val payload = JSONObject()
+        .put("type", "dial")
+        .put("box_id", request.boxId)
+        .put("number", request.number)
+        .put("sdp", offerSdp)
+      if (!ws.send(payload.toString())) {
+        error("dial signaling failed")
+      }
+      CallTelecomManager.markDialing()
+    } catch (e: Exception) {
+      outgoingSignalStarted = false
+      throw e
+    }
+  }
+
+  private fun hasOngoingCall(): Boolean {
+    return callActive || outgoingSignalStarted || _callBusy.value || _inCall.value || peerConnection != null
+  }
+
+  private fun disconnectCauseFor(reason: String, detail: String = ""): Int {
+    val combined = listOf(reason, detail)
+      .joinToString(" ")
+      .trim()
+      .lowercase()
+    return when {
+      combined.contains("busy") || combined.contains("486") -> DisconnectCause.BUSY
+      combined.contains("reject") || combined.contains("decline") -> DisconnectCause.REJECTED
+      combined.contains("timeout") || combined.contains("missed") || combined.contains("480") -> DisconnectCause.MISSED
+      combined.contains("error") || combined.contains("fail") || combined.contains("invalid") -> DisconnectCause.ERROR
+      combined.contains("remote") || combined.contains("bye") || combined.contains("hangup") || combined.contains("ended") ->
+        DisconnectCause.REMOTE
+      else -> DisconnectCause.LOCAL
+    }
+  }
+
+  private fun endCall(
+    reason: String,
+    showEndedNotification: Boolean = true,
+    disconnectCause: Int = DisconnectCause.LOCAL,
+  ) {
     if (endingCall) {
       _callStatus.value = reason
       return
     }
     endingCall = true
     callActive = false
+    outgoingSignalStarted = false
     _inCall.value = false
     _callBusy.value = false
     _callStatus.value = reason
+    _activeCallInfo.value = ActiveCallInfo()
+    _muted.value = false
     try {
       iceDisconnectJob?.cancel()
       iceDisconnectJob = null
       closePeer()
       configureAudioForCall(false)
       evaluateConnectionPolicy()
+      updateIncomingPresentation()
       _events.tryEmit("call_changed")
+      if (showEndedNotification && reason.isNotBlank()) {
+        notificationManager.showCallEnded(reason)
+      }
+      CallTelecomManager.clearDisconnected(disconnectCause)
     } finally {
       endingCall = false
     }
@@ -489,11 +931,23 @@ class CallController(private val context: Context) {
     iceDisconnectJob = null
     val pc = peerConnection
     peerConnection = null
-    try { pc?.close() } catch (_: Exception) {}
-    try { pc?.dispose() } catch (_: Exception) {}
-    try { audioTrack?.dispose() } catch (_: Exception) {}
+    try {
+      pc?.close()
+    } catch (_: Exception) {
+    }
+    try {
+      pc?.dispose()
+    } catch (_: Exception) {
+    }
+    try {
+      audioTrack?.dispose()
+    } catch (_: Exception) {
+    }
     audioTrack = null
-    try { audioSource?.dispose() } catch (_: Exception) {}
+    try {
+      audioSource?.dispose()
+    } catch (_: Exception) {
+    }
     audioSource = null
   }
 
@@ -504,25 +958,31 @@ class CallController(private val context: Context) {
       prevSpeaker = audioManager.isSpeakerphoneOn
       prevMicMute = audioManager.isMicrophoneMute
       prevBluetoothSco = audioManager.isBluetoothScoOn
-      audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+      if (!CallTelecomManager.hasActiveConnection()) {
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+      }
       audioManager.isMicrophoneMute = false
       audioConfigured = true
+      stopRinging()
+      notificationManager.cancelIncomingCall()
       refreshBluetoothAvailability()
       applyAudioOutput(preferredAudioOutput)
       return
     }
 
     if (!audioConfigured) return
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-      audioManager.clearCommunicationDevice()
-    } else {
-      audioManager.stopBluetoothSco()
-      audioManager.isBluetoothScoOn = false
+    if (!CallTelecomManager.hasActiveConnection()) {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        audioManager.clearCommunicationDevice()
+      } else {
+        audioManager.stopBluetoothSco()
+        audioManager.isBluetoothScoOn = false
+      }
+      audioManager.isSpeakerphoneOn = prevSpeaker
+      audioManager.mode = prevAudioMode
     }
     audioManager.isMicrophoneMute = prevMicMute
     audioManager.isBluetoothScoOn = prevBluetoothSco
-    audioManager.isSpeakerphoneOn = prevSpeaker
-    audioManager.mode = prevAudioMode
     audioConfigured = false
     _audioOutput.value = preferredAudioOutput
     refreshBluetoothAvailability()
@@ -539,6 +999,13 @@ class CallController(private val context: Context) {
 
   private fun applyAudioOutput(output: AudioOutput): Boolean {
     refreshBluetoothAvailability()
+
+    if (CallTelecomManager.hasActiveConnection()) {
+      if (CallTelecomManager.setAudioRoute(output)) {
+        _audioOutput.value = output
+        return true
+      }
+    }
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
       val targetTypes = when (output) {
@@ -593,7 +1060,24 @@ class CallController(private val context: Context) {
     )
   }
 
-  private data class SessionAuth(val serverAddr: String, val cookieName: String, val cookieValue: String)
+  private fun toPendingIncoming(dto: IncomingCallDto): PendingIncomingCall {
+    return PendingIncomingCall(
+      inviteId = dto.id,
+      boxId = dto.boxId,
+      boxName = dto.boxName,
+      callerId = dto.callerId,
+      remoteNumber = dto.remoteNumber,
+      state = dto.state,
+    )
+  }
+
+  private fun displayCaller(call: PendingIncomingCall): String {
+    return firstNonBlank(call.callerId, call.remoteNumber, "Unknown")
+  }
+
+  private fun firstNonBlank(vararg values: String): String {
+    return values.firstOrNull { it.isNotBlank() }.orEmpty()
+  }
 }
 
 private suspend fun PeerConnection.awaitCreateOffer(): SessionDescription = suspendCancellableCoroutine { cont ->
@@ -601,10 +1085,13 @@ private suspend fun PeerConnection.awaitCreateOffer(): SessionDescription = susp
     override fun onCreateSuccess(desc: SessionDescription?) {
       if (desc != null) cont.resume(desc) else cont.resumeWithException(IllegalStateException("offer null"))
     }
+
     override fun onSetSuccess() = Unit
+
     override fun onCreateFailure(error: String?) {
       cont.resumeWithException(IllegalStateException(error ?: "create offer failed"))
     }
+
     override fun onSetFailure(error: String?) = Unit
   }, MediaConstraints().apply {
     mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"))
@@ -614,8 +1101,11 @@ private suspend fun PeerConnection.awaitCreateOffer(): SessionDescription = susp
 private suspend fun PeerConnection.awaitSetLocal(desc: SessionDescription): Unit = suspendCancellableCoroutine { cont ->
   setLocalDescription(object : SdpObserver {
     override fun onCreateSuccess(desc: SessionDescription?) = Unit
+
     override fun onSetSuccess() = cont.resume(Unit)
+
     override fun onCreateFailure(error: String?) = Unit
+
     override fun onSetFailure(error: String?) {
       cont.resumeWithException(IllegalStateException(error ?: "set local failed"))
     }
@@ -625,8 +1115,11 @@ private suspend fun PeerConnection.awaitSetLocal(desc: SessionDescription): Unit
 private suspend fun PeerConnection.awaitSetRemote(desc: SessionDescription): Unit = suspendCancellableCoroutine { cont ->
   setRemoteDescription(object : SdpObserver {
     override fun onCreateSuccess(desc: SessionDescription?) = Unit
+
     override fun onSetSuccess() = cont.resume(Unit)
+
     override fun onCreateFailure(error: String?) = Unit
+
     override fun onSetFailure(error: String?) {
       cont.resumeWithException(IllegalStateException(error ?: "set remote failed"))
     }

@@ -35,20 +35,31 @@ For these devices, minimum setup is:
 
 ## Quick Start
 
-1. Edit `config.yaml`.
-2. Start server:
+1. Copy the example config and edit it:
+
+```bash
+cp config.yaml.example config.yaml
+```
+
+2. Set at least:
+  - `sip.advertised_ip` and `media.public_ip` to the IP reachable by FXO boxes and browsers
+  - `database.path` to your SQLite file
+  - `auth.access_ttl_minutes` / `auth.refresh_ttl_hours` to your desired session lifetime
+  - `fcm.*` only if you want Android / browser push notifications
+
+3. Start server:
 
 ```bash
 go run . -config config.yaml
 ```
 
-3. Open web UI:
+4. Open web UI:
 
 ```text
 http://<server-ip>:8080
 ```
 
-4. Login with bootstrap admin:
+5. Login with bootstrap admin:
   - first run (DB not exists): check console output for generated password
   - existing DB: use your existing admin password
 
@@ -110,9 +121,32 @@ database:
   path: "./callfxo.db"
 
 auth:
-  cookie_name: "callfxo_session"
-  session_ttl_hours: 24
+  cookie_name: "callfxo_access"
+  access_ttl_minutes: 60
+  refresh_ttl_hours: 720
+
+fcm:
+  enabled: false
+  project_id: ""
+  app_id: ""
+  api_key: ""
+  messaging_sender_id: ""
+  auth_domain: ""
+  storage_bucket: ""
+  measurement_id: ""
+  vapid_key: ""
+  service_account_json: ""
 ```
+
+Use `config.yaml.example` as the authoritative template. Legacy `auth.session_ttl_hours` is still read for compatibility, but new deployments should use `access_ttl_minutes` and `refresh_ttl_hours`.
+
+## FCM Push
+
+- The server is the source of truth for Firebase config. Android and web clients fetch `/api/push/config` after login and cache it locally.
+- Set `fcm.enabled: true` only when you want push notifications for incoming calls.
+- `fcm.service_account_json` must point to a readable Firebase service account JSON file on the server. This is required for sending FCM messages.
+- Browser push also needs `fcm.vapid_key`.
+- If FCM is disabled or not configured, foreground web / app calling still works; only push wake-up notifications are skipped.
 
 ## Roles
 

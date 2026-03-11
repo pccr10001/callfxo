@@ -319,6 +319,48 @@ small {
   opacity: 0.85;
 }
 
+.call-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 18, 14, 0.66);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 60;
+}
+
+.call-sheet {
+  width: min(460px, 94vw);
+  padding: 28px;
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at top left, rgba(255, 216, 194, 0.6), rgba(255, 255, 255, 0) 45%),
+    linear-gradient(180deg, #fff8f2 0%, #ffffff 100%);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.25);
+  text-align: center;
+}
+
+.call-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+
+.call-sub {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.call-timer {
+  margin-top: 16px;
+  font-family: "Space Grotesk", "Noto Sans TC", sans-serif;
+  font-size: 40px;
+  font-weight: 700;
+}
+
 @media (max-width: 900px) {
   .grid-2 {
     grid-template-columns: 1fr;

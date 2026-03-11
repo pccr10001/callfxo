@@ -1,7 +1,13 @@
-﻿<resources>
+<resources>
   <string name="app_name">CallFXO</string>
   <string name="notif_channel_call">CallFXO Calls</string>
+  <string name="notif_channel_incoming">CallFXO Incoming Calls</string>
   <string name="notif_call_active">Call in progress</string>
   <string name="notif_call_active_desc">Tap to return to CallFXO</string>
   <string name="notif_call_ended">Call ended</string>
+  <string name="notif_incoming_body">Incoming call on %1$s</string>
+  <string name="notif_incoming_body_generic">Tap to answer in CallFXO</string>
+  <string name="incoming_unknown">Unknown caller</string>
+  <string name="action_answer">Answer</string>
+  <string name="action_reject">Reject</string>
 </resources>

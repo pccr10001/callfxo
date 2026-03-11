@@ -1,4 +1,4 @@
-﻿const I18N = {
+const I18N = {
   'zh-TW': {
     'app.title': 'CallFXO 控制台',
     'lang.label': '語言',
@@ -46,6 +46,14 @@
     'fxo.prompt.pass': 'SIP 密碼(留空表示不變更)',
     'fxo.status.online': '在線',
     'fxo.status.offline': '離線',
+    'fxo.permissions': '權限',
+    'fxo.notify': '通知',
+    'fxo.perm.title': '{name} - 使用者權限',
+    'fxo.perm.user': '使用者',
+    'fxo.perm.dial': '撥號',
+    'fxo.perm.incoming': '來電',
+    'fxo.perm.close': '關閉',
+    'fxo.perm.noUsers': '沒有一般使用者',
 
     'dial.title': '撥號',
     'dial.boxLabel': '選擇 FXO 盒子',
@@ -165,6 +173,14 @@
     'fxo.prompt.pass': 'SIP password (leave empty to keep unchanged)',
     'fxo.status.online': 'Online',
     'fxo.status.offline': 'Offline',
+    'fxo.permissions': 'Permissions',
+    'fxo.notify': 'Notify',
+    'fxo.perm.title': '{name} - User Permissions',
+    'fxo.perm.user': 'User',
+    'fxo.perm.dial': 'Dial',
+    'fxo.perm.incoming': 'Incoming',
+    'fxo.perm.close': 'Close',
+    'fxo.perm.noUsers': 'No regular users',
 
     'dial.title': 'Dial',
     'dial.boxLabel': 'Select FXO box',
@@ -258,6 +274,16 @@ function resolveInitialLang() {
   return browserLang ? normalizeLang(browserLang) : DEFAULT_LANG;
 }
 
+function getDeviceToken() {
+  try {
+    const saved = localStorage.getItem('callfxo_device_token');
+    if (saved) return saved;
+  } catch (_) {}
+  const created = `web-${crypto.randomUUID()}`;
+  try { localStorage.setItem('callfxo_device_token', created); } catch (_) {}
+  return created;
+}
+
 const state = {
   me: null,
   boxes: [],
@@ -278,6 +304,16 @@ const state = {
   contactSearchTimer: null,
   playbackVolume: 1,
   active: false,
+  muted: false,
+  deviceToken: getDeviceToken(),
+  incomingCall: null,
+  callPeer: null,
+  callMode: '',
+  callStartedAt: 0,
+  callTimerHandle: null,
+  pushConfig: null,
+  firebaseApp: null,
+  firebaseMessaging: null,
   lang: resolveInitialLang(),
 };
 
@@ -305,6 +341,20 @@ const userAdminPanel = document.getElementById('userAdminPanel');
 const boxAdminPanel = document.getElementById('boxAdminPanel');
 const rootContainer = document.querySelector('.container');
 const langSwitch = document.getElementById('langSwitch');
+const permissionHead = document.getElementById('permissionHead');
+const permissionTable = document.getElementById('permissionTable');
+const refreshPermissionBtn = document.getElementById('refreshPermissionBtn');
+const incomingDialog = document.getElementById('incomingDialog');
+const incomingCaller = document.getElementById('incomingCaller');
+const incomingMeta = document.getElementById('incomingMeta');
+const incomingAcceptBtn = document.getElementById('incomingAcceptBtn');
+const incomingRejectBtn = document.getElementById('incomingRejectBtn');
+const callScreen = document.getElementById('callScreen');
+const callPeerName = document.getElementById('callPeerName');
+const callPeerMeta = document.getElementById('callPeerMeta');
+const callTimer = document.getElementById('callTimer');
+const muteBtn = document.getElementById('muteBtn');
+const callScreenHangupBtn = document.getElementById('callScreenHangupBtn');
 
 function t(key, vars = {}) {
   const table = I18N[state.lang] || I18N[DEFAULT_LANG];
@@ -360,9 +410,75 @@ function formatLogTime(value) {
 
 function setDialNumber(number) {
   const n = String(number || '').trim();
-  if (!n || !dialNumberInput) return;
+  if (!dialNumberInput) return;
   dialNumberInput.value = n;
-  dialNumberInput.focus();
+}
+
+function appendDialDigit(digit) {
+  if (!dialNumberInput) return;
+  dialNumberInput.value = `${dialNumberInput.value || ''}${digit}`;
+}
+
+function setCallPeer(name, meta = '') {
+  state.callPeer = { name, meta };
+  setText(callPeerName, name || 'Unknown');
+  setText(callPeerMeta, meta || '');
+}
+
+function showIncomingDialog(item) {
+  state.incomingCall = item || null;
+  if (!item) {
+    incomingDialog?.classList.add('hide');
+    return;
+  }
+  setText(incomingCaller, item.caller_id || item.remote_number || 'Unknown');
+  setText(incomingMeta, `${item.box_name || 'FXO'}${item.remote_number ? ` · ${item.remote_number}` : ''}`);
+  incomingDialog?.classList.remove('hide');
+}
+
+function hideIncomingDialog() {
+  state.incomingCall = null;
+  incomingDialog?.classList.add('hide');
+}
+
+function startCallTimer() {
+  stopCallTimer();
+  state.callStartedAt = Date.now();
+  const tick = () => {
+    const sec = Math.max(0, Math.floor((Date.now() - state.callStartedAt) / 1000));
+    const mm = String(Math.floor(sec / 60)).padStart(2, '0');
+    const ss = String(sec % 60).padStart(2, '0');
+    setText(callTimer, `${mm}:${ss}`);
+  };
+  tick();
+  state.callTimerHandle = setInterval(tick, 1000);
+}
+
+function stopCallTimer() {
+  if (state.callTimerHandle) {
+    clearInterval(state.callTimerHandle);
+    state.callTimerHandle = null;
+  }
+  setText(callTimer, '00:00');
+}
+
+function showCallScreen(visible) {
+  callScreen?.classList.toggle('hide', !visible);
+  if (!visible) {
+    stopCallTimer();
+  }
+}
+
+function setMuted(muted) {
+  state.muted = !!muted;
+  if (state.localStream) {
+    state.localStream.getAudioTracks().forEach((track) => {
+      track.enabled = !state.muted;
+    });
+  }
+  if (muteBtn) {
+    muteBtn.textContent = state.muted ? '取消靜音' : '靜音';
+  }
 }
 
 function updateCallLogPaginationUI() {
@@ -494,6 +610,23 @@ async function refreshContacts(query = state.contactQuery) {
   renderContacts(data.items || []);
 }
 
+async function refreshIncomingCalls() {
+  const data = await api('/api/incoming');
+  const items = data.items || [];
+  const targetInvite = new URLSearchParams(location.search).get('incoming');
+  const match = items.find((item) => !targetInvite || item.id === targetInvite);
+  if (match) {
+    showIncomingDialog({
+      invite_id: match.id,
+      caller_id: match.caller_id,
+      remote_number: match.remote_number,
+      box_name: match.box_name,
+    });
+  } else if (!state.active) {
+    hideIncomingDialog();
+  }
+}
+
 function applyI18nToDOM() {
   document.documentElement.lang = state.lang === 'zh-TW' ? 'zh-Hant' : 'en';
   document.title = t('app.title');
@@ -542,19 +675,42 @@ function setLanguage(lang, rerender = true) {
   if (rerender && state.me) {
     refreshBoxes().catch(() => {});
     if (isAdmin()) refreshUsers().catch(() => {});
+    if (isAdmin()) refreshPermissions().catch(() => {});
     refreshCallLogs(state.callLogsPage).catch(() => {});
     refreshContacts(state.contactQuery).catch(() => {});
   }
 }
 
-async function api(path, options = {}) {
-  const res = await fetch(path, {
+async function refreshAccessToken() {
+  const res = await fetch('/api/refresh', {
+    method: 'POST',
     credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      device_token: state.deviceToken,
+      client_type: 'web',
+      device_name: navigator.userAgent || 'browser',
+    }),
+  });
+  if (!res.ok) {
+    throw new Error('refresh failed');
+  }
+  return res.json().catch(() => ({}));
+}
+
+async function api(path, options = {}, allowRefresh = true) {
+  const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+  const res = await fetch(path, {
+    credentials: 'include',
     ...options,
+    headers,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    if (res.status === 401 && allowRefresh && path !== '/api/refresh' && path !== '/api/login') {
+      await refreshAccessToken();
+      return api(path, options, false);
+    }
     throw new Error(data.error || `HTTP ${res.status}`);
   }
   return data;
@@ -591,6 +747,7 @@ async function checkMe() {
     const data = await api('/api/me');
     if (data.authenticated) {
       state.me = data.user;
+      state.deviceToken = data.device_token || state.deviceToken;
       showApp(true);
       await initAuthed();
     } else {
@@ -606,6 +763,8 @@ async function checkMe() {
       if (myNewPassInput) myNewPassInput.value = '';
       renderCallLogs([]);
       renderContacts([]);
+      hideIncomingDialog();
+      showCallScreen(false);
       showApp(false);
       setText(loginMsg, t('login.prompt'));
     }
@@ -622,6 +781,8 @@ async function checkMe() {
     if (myNewPassInput) myNewPassInput.value = '';
     renderCallLogs([]);
     renderContacts([]);
+    hideIncomingDialog();
+    showCallScreen(false);
     showApp(false);
     setText(loginMsg, t('login.prompt'));
   }
@@ -633,10 +794,11 @@ async function initAuthed() {
   state.callLogsTotal = 0;
   state.callLogsTotalPages = 1;
   if (isAdmin()) {
-    await Promise.all([refreshUsers(), refreshBoxes(), refreshCallLogs(1), refreshContacts(state.contactQuery)]);
+    await Promise.all([refreshUsers(), refreshBoxes(), refreshCallLogs(1), refreshContacts(state.contactQuery), refreshPermissions(), refreshIncomingCalls()]);
   } else {
-    await Promise.all([refreshBoxes(), refreshCallLogs(1), refreshContacts(state.contactQuery)]);
+    await Promise.all([refreshBoxes(), refreshCallLogs(1), refreshContacts(state.contactQuery), refreshIncomingCalls()]);
   }
+  await initPush().catch(() => {});
   startCallLogPolling();
   connectWS();
 }
@@ -712,35 +874,50 @@ async function refreshBoxes() {
     const name = escapeHTML(b.name || '');
     const sipUser = escapeHTML(b.sip_username || '');
     const tr = document.createElement('tr');
-    const actionHTML = admin
-      ? `<button data-act="edit" style="max-width:70px;">${escapeHTML(t('fxo.edit'))}</button><button data-act="del" class="warn" style="max-width:70px;">${escapeHTML(t('fxo.delete'))}</button>`
-      : '<span style="color:#888;">-</span>';
+
+    let actionParts = [];
+    if (admin) {
+      actionParts.push(`<button data-act="edit" style="max-width:70px;">${escapeHTML(t('fxo.edit'))}</button>`);
+      actionParts.push(`<button data-act="del" class="warn" style="max-width:70px;">${escapeHTML(t('fxo.delete'))}</button>`);
+      actionParts.push(`<button data-act="perm" style="max-width:70px;">${escapeHTML(t('fxo.permissions'))}</button>`);
+    }
+    if (b.can_receive) {
+      actionParts.push(`<label style="display:inline-flex;align-items:center;gap:4px;margin-left:8px;cursor:pointer;"><input type="checkbox" data-act="notify" ${b.notify_incoming ? 'checked' : ''} /> ${escapeHTML(t('fxo.notify'))}</label>`);
+    }
+    const actionHTML = actionParts.length ? actionParts.join(' ') : '<span style="color:#888;">-</span>';
+
     tr.innerHTML = `
       <td>${name}</td>
       <td>${sipUser}</td>
       <td>${boxStatusHTML(b)}</td>
       <td>${actionHTML}</td>
     `;
-    const [editBtn, delBtn] = tr.querySelectorAll('button');
 
-    if (admin && editBtn && delBtn) {
+    const editBtn = tr.querySelector('button[data-act="edit"]');
+    const delBtn = tr.querySelector('button[data-act="del"]');
+    const permBtn = tr.querySelector('button[data-act="perm"]');
+    const notifyChk = tr.querySelector('input[data-act="notify"]');
+
+    if (admin && editBtn) {
       editBtn.onclick = async () => {
-        const name = prompt(t('fxo.prompt.name'), b.name) ?? '';
-        if (!name.trim()) return;
+        const newName = prompt(t('fxo.prompt.name'), b.name) ?? '';
+        if (!newName.trim()) return;
         const user = prompt(t('fxo.prompt.user'), b.sip_username) ?? '';
         if (!user.trim()) return;
         const pass = prompt(t('fxo.prompt.pass'), '');
         try {
           await api(`/api/fxo/${b.id}`, {
             method: 'PUT',
-            body: JSON.stringify({ name, sip_username: user, sip_password: pass || '' }),
+            body: JSON.stringify({ name: newName, sip_username: user, sip_password: pass || '' }),
           });
           await refreshBoxes();
         } catch (e) {
           alert(e.message);
         }
       };
+    }
 
+    if (admin && delBtn) {
       delBtn.onclick = async () => {
         if (!confirm(t('fxo.deleteConfirm', { name: b.name }))) return;
         try {
@@ -752,12 +929,145 @@ async function refreshBoxes() {
       };
     }
 
+    if (admin && permBtn) {
+      permBtn.onclick = () => showPermissionModal(b);
+    }
+
+    if (notifyChk) {
+      notifyChk.onchange = async () => {
+        try {
+          await api(`/api/fxo/${b.id}/notify`, {
+            method: 'PUT',
+            body: JSON.stringify({ notify: notifyChk.checked }),
+          });
+        } catch (e) {
+          alert(e.message || e);
+          notifyChk.checked = !notifyChk.checked;
+        }
+      };
+    }
+
     tbody.appendChild(tr);
 
-    const opt = document.createElement('option');
-    opt.value = b.id;
-    opt.textContent = `${b.name} (${b.sip_username}) ${b.online ? t('fxo.status.online') : t('fxo.status.offline')}`;
-    dialBox.appendChild(opt);
+    if (b.can_dial) {
+      const opt = document.createElement('option');
+      opt.value = b.id;
+      opt.textContent = `${b.name} (${b.sip_username}) ${b.online ? t('fxo.status.online') : t('fxo.status.offline')}`;
+      dialBox.appendChild(opt);
+    }
+  });
+}
+
+async function showPermissionModal(box) {
+  const dialog = document.getElementById('fxoPermDialog');
+  if (!dialog) return;
+  const titleEl = document.getElementById('fxoPermTitle');
+  const bodyEl = document.getElementById('fxoPermBody');
+  const closeBtn = document.getElementById('fxoPermCloseBtn');
+  if (titleEl) titleEl.textContent = t('fxo.perm.title', { name: box.name || `#${box.id}` });
+  if (bodyEl) bodyEl.innerHTML = '<p style="text-align:center;padding:20px;">...</p>';
+  dialog.classList.remove('hide');
+
+  if (closeBtn) {
+    closeBtn.onclick = () => dialog.classList.add('hide');
+  }
+  dialog.onclick = (e) => { if (e.target === dialog) dialog.classList.add('hide'); };
+
+  try {
+    const data = await api('/api/fxo-permissions');
+    const users = data.users || [];
+    const items = new Map((data.items || []).map((item) => [`${item.user_id}:${item.fxo_box_id}`, item]));
+
+    if (!users.length) {
+      bodyEl.innerHTML = `<p style="text-align:center;padding:20px;color:#888;">${escapeHTML(t('fxo.perm.noUsers'))}</p>`;
+      return;
+    }
+
+    let tableHTML = `<table class="table"><thead><tr>
+      <th>${escapeHTML(t('fxo.perm.user'))}</th>
+      <th>${escapeHTML(t('fxo.perm.dial'))}</th>
+      <th>${escapeHTML(t('fxo.perm.incoming'))}</th>
+    </tr></thead><tbody>`;
+    users.forEach((user) => {
+      const key = `${user.id}:${box.id}`;
+      const item = items.get(key) || {};
+      tableHTML += `<tr>
+        <td>${escapeHTML(user.username)}</td>
+        <td><input type="checkbox" data-kind="dial" data-user="${user.id}" ${item.can_dial ? 'checked' : ''} /></td>
+        <td><input type="checkbox" data-kind="incoming" data-user="${user.id}" ${item.can_receive ? 'checked' : ''} /></td>
+      </tr>`;
+    });
+    tableHTML += '</tbody></table>';
+    bodyEl.innerHTML = tableHTML;
+
+    bodyEl.querySelectorAll('input[type="checkbox"]').forEach((input) => {
+      input.onchange = async () => {
+        const userId = Number(input.dataset.user || '0');
+        const dialEl = bodyEl.querySelector(`input[data-kind="dial"][data-user="${userId}"]`);
+        const incomingEl = bodyEl.querySelector(`input[data-kind="incoming"][data-user="${userId}"]`);
+        const dial = dialEl?.checked || false;
+        const incoming = incomingEl?.checked || false;
+        try {
+          await api('/api/fxo-permissions', {
+            method: 'PUT',
+            body: JSON.stringify({ user_id: userId, box_id: box.id, can_dial: dial, can_receive: incoming }),
+          });
+        } catch (e) {
+          alert(e.message || e);
+          showPermissionModal(box);
+        }
+      };
+    });
+  } catch (e) {
+    bodyEl.innerHTML = `<p style="text-align:center;color:red;">${escapeHTML(e.message || e)}</p>`;
+  }
+}
+
+async function refreshPermissions() {
+  // no-op: permissions are now managed per-box via modal
+}
+async function initPush() {
+  if (!('serviceWorker' in navigator) || !window.firebase) return;
+  const data = await api('/api/push/config').catch(() => null);
+  const cfg = data?.item;
+  state.pushConfig = cfg || null;
+  if (!cfg || !cfg.enabled) return;
+  const reg = await navigator.serviceWorker.register('/firebase-messaging-sw.js', { scope: '/' });
+  if (state.firebaseApp) return;
+  state.firebaseApp = firebase.initializeApp({
+    apiKey: cfg.web_api_key,
+    appId: cfg.web_app_id,
+    projectId: cfg.project_id,
+    messagingSenderId: cfg.messaging_sender_id,
+    authDomain: cfg.auth_domain || undefined,
+    storageBucket: cfg.storage_bucket || undefined,
+    measurementId: cfg.measurement_id || undefined,
+  }, `callfxo-${cfg.project_id}`);
+  state.firebaseMessaging = firebase.messaging(state.firebaseApp);
+  if (Notification.permission === 'default') {
+    await Notification.requestPermission().catch(() => {});
+  }
+  if (Notification.permission !== 'granted') return;
+  const token = await state.firebaseMessaging.getToken({
+    vapidKey: cfg.vapid_key || undefined,
+    serviceWorkerRegistration: reg,
+  }).catch(() => '');
+  if (token) {
+    await api('/api/device/push', {
+      method: 'POST',
+      body: JSON.stringify({ push_platform: 'web_fcm', push_token: token }),
+    }).catch(() => {});
+  }
+  state.firebaseMessaging.onMessage((payload) => {
+    const dataPayload = payload?.data || {};
+    if (dataPayload.event === 'incoming_call') {
+      showIncomingDialog({
+        invite_id: dataPayload.invite_id,
+        caller_id: dataPayload.caller_id,
+        remote_number: dataPayload.remote_number,
+        box_name: dataPayload.box_name,
+      });
+    }
   });
 }
 
@@ -775,7 +1085,9 @@ function connectWS() {
       setText(callStatus, t('call.wsReconnect'));
     }
     if (state.me) {
-      setTimeout(connectWS, 1200);
+      refreshAccessToken().catch(() => {}).finally(() => {
+        setTimeout(connectWS, 1200);
+      });
     }
   };
   ws.onerror = () => setText(wsStatus, t('ws.error'));
@@ -788,6 +1100,9 @@ function connectWS() {
           await state.pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
           setText(callStatus, t('call.connected'));
           state.active = true;
+          hideIncomingDialog();
+          showCallScreen(true);
+          startCallTimer();
           refreshCallLogs(1).catch(() => {});
         }
         break;
@@ -808,6 +1123,19 @@ function connectWS() {
         setText(callStatus, t('call.ended', { reason: msg.reason || '' }));
         cleanupPeer(false);
         refreshCallLogs(1).catch(() => {});
+        break;
+      case 'incoming_call':
+        showIncomingDialog(msg);
+        break;
+      case 'incoming_stop':
+        if (state.incomingCall && state.incomingCall.invite_id === msg.invite_id) {
+          hideIncomingDialog();
+        }
+        break;
+      case 'incoming_answered':
+        if (state.incomingCall && state.incomingCall.invite_id === msg.invite_id) {
+          hideIncomingDialog();
+        }
         break;
       case 'error':
         setText(callStatus, t('error.prefix', { error: msg.error }));
@@ -933,6 +1261,9 @@ async function startDial() {
 
   const pc = new RTCPeerConnection();
   state.pc = pc;
+  state.callMode = 'outgoing';
+  const selectedBox = state.boxes.find((box) => Number(box.id) === boxId);
+  setCallPeer(number, selectedBox ? selectedBox.name : '');
 
   pc.onicecandidate = (e) => {
     if (e.candidate && state.ws && state.ws.readyState === WebSocket.OPEN) {
@@ -969,11 +1300,68 @@ async function startDial() {
   }));
 }
 
+async function acceptIncomingCall() {
+  const incoming = state.incomingCall;
+  if (!incoming || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  if (state.pc) {
+    alert(t('alert.callActive'));
+    return;
+  }
+  if (!supportsPCMU()) {
+    alert(t('alert.noPCMU'));
+    return;
+  }
+
+  const audioCtx = ensureAudioContext();
+  if (audioCtx.state === 'suspended') {
+    await audioCtx.resume();
+  }
+
+  const pc = new RTCPeerConnection();
+  state.pc = pc;
+  state.callMode = 'incoming';
+  setCallPeer(incoming.caller_id || incoming.remote_number || 'Unknown', incoming.box_name || '');
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate && state.ws && state.ws.readyState === WebSocket.OPEN) {
+      state.ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate.toJSON() }));
+    }
+  };
+  pc.onconnectionstatechange = () => {
+    if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) {
+      cleanupPeer(false);
+    }
+  };
+  pc.ontrack = (e) => {
+    const stream = (e.streams && e.streams[0]) ? e.streams[0] : new MediaStream([e.track]);
+    attachRemoteAudio(stream).catch((err) => {
+      setText(callStatus, t('error.remoteAudio', { error: err.message || err }));
+    });
+  };
+
+  const tx = pc.addTransceiver('audio', { direction: 'sendrecv' });
+  preferPCMU(tx);
+
+  const stream = await ensureAudio();
+  stream.getAudioTracks().forEach((track) => pc.addTrack(track, stream));
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  state.ws.send(JSON.stringify({
+    type: 'incoming_accept',
+    invite_id: incoming.invite_id,
+    sdp: pc.localDescription.sdp,
+  }));
+}
+
 function cleanupPeer(sendHangup) {
   if (sendHangup && state.ws && state.ws.readyState === WebSocket.OPEN) {
     state.ws.send(JSON.stringify({ type: 'hangup' }));
   }
   state.active = false;
+  state.callMode = '';
+  setMuted(false);
+  showCallScreen(false);
   teardownRemoteAudio();
   if (state.pc) {
     try { state.pc.close(); } catch (_) {}
@@ -990,9 +1378,19 @@ function bindEvents() {
     const username = document.getElementById('loginUser').value.trim();
     const password = document.getElementById('loginPass').value;
     try {
-      const res = await api('/api/login', { method: 'POST', body: JSON.stringify({ username, password }) });
+      const res = await api('/api/login', {
+        method: 'POST',
+        body: JSON.stringify({
+          username,
+          password,
+          device_token: state.deviceToken,
+          client_type: 'web',
+          device_name: navigator.userAgent || 'browser',
+        }),
+      }, false);
       setText(loginMsg, t('login.success'));
       state.me = res.user || { username, role: 'user' };
+      state.deviceToken = res.device_token || state.deviceToken;
       showApp(true);
       await initAuthed();
     } catch (e) {
@@ -1019,6 +1417,8 @@ function bindEvents() {
     if (myNewPassInput) myNewPassInput.value = '';
     renderCallLogs([]);
     renderContacts([]);
+    hideIncomingDialog();
+    showCallScreen(false);
     await api('/api/logout', { method: 'POST' }).catch(() => {});
     showApp(false);
     applyRoleUI();
@@ -1046,6 +1446,8 @@ function bindEvents() {
         alert(t('pwd.changed'));
         if (res && res.relogin) {
           state.me = null;
+          hideIncomingDialog();
+          showCallScreen(false);
           showApp(false);
           applyRoleUI();
           setText(loginMsg, t('login.prompt'));
@@ -1153,8 +1555,12 @@ function bindEvents() {
   document.querySelectorAll('#kpad button').forEach((btn) => {
     btn.onclick = () => {
       const d = btn.dataset.dtmf;
-      if (!d || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
-      state.ws.send(JSON.stringify({ type: 'dtmf', digits: d }));
+      if (!d) return;
+      if (state.active && state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: 'dtmf', digits: d }));
+        return;
+      }
+      appendDialDigit(d);
     };
   });
 
@@ -1170,6 +1576,31 @@ function bindEvents() {
   if (langSwitch) {
     langSwitch.onchange = () => {
       setLanguage(langSwitch.value, true);
+    };
+  }
+
+  if (refreshPermissionBtn) {
+    refreshPermissionBtn.onclick = () => refreshPermissions().catch(() => {});
+  }
+
+  if (incomingAcceptBtn) {
+    incomingAcceptBtn.onclick = () => acceptIncomingCall().catch((e) => alert(e.message || e));
+  }
+  if (incomingRejectBtn) {
+    incomingRejectBtn.onclick = () => {
+      if (state.incomingCall && state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: 'incoming_reject', invite_id: state.incomingCall.invite_id }));
+      }
+      hideIncomingDialog();
+    };
+  }
+  if (muteBtn) {
+    muteBtn.onclick = () => setMuted(!state.muted);
+  }
+  if (callScreenHangupBtn) {
+    callScreenHangupBtn.onclick = () => {
+      cleanupPeer(true);
+      setText(callStatus, t('dial.sentHangup'));
     };
   }
 }
