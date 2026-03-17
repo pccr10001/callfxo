@@ -133,12 +133,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
   private fun restoreSession() {
     val s = api.currentSession() ?: return
-    _ui.value = _ui.value.copy(serverAddr = s.serverAddr, username = s.username, usernameInput = s.username)
+    _ui.value = _ui.value.copy(
+      serverAddr = s.serverAddr,
+      username = s.username,
+      usernameInput = s.username,
+      loggedIn = true,
+      loginError = null,
+    )
+    callController.onSessionChanged()
 
     viewModelScope.launch {
       api.me().onSuccess { me ->
         if (me.authenticated && me.user != null) {
-          callController.onSessionChanged()
           _ui.value = _ui.value.copy(
             loggedIn = true,
             username = me.user.username,
@@ -148,12 +154,76 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
           refreshAll()
           syncPushRegistration()
         } else {
-          sessionStore.clearSession()
+          api.refreshWithRetry().onSuccess {
+            api.me().onSuccess { refreshedMe ->
+              if (refreshedMe.authenticated && refreshedMe.user != null) {
+                _ui.value = _ui.value.copy(
+                  loggedIn = true,
+                  username = refreshedMe.user.username,
+                  role = refreshedMe.user.role,
+                  loginError = null,
+                )
+                refreshAll()
+                syncPushRegistration()
+              } else {
+                handleAuthInvalidation()
+              }
+            }.onFailure { meErr ->
+              if (isAuthError(meErr)) {
+                handleAuthInvalidation()
+              }
+            }
+          }.onFailure { refreshErr ->
+            if (isAuthError(refreshErr)) {
+              handleAuthInvalidation()
+            }
+          }
         }
       }.onFailure {
-        sessionStore.clearSession()
+        api.refreshWithRetry().onSuccess {
+          api.me().onSuccess { me ->
+            if (me.authenticated && me.user != null) {
+              _ui.value = _ui.value.copy(
+                loggedIn = true,
+                username = me.user.username,
+                role = me.user.role,
+                loginError = null,
+              )
+              refreshAll()
+              syncPushRegistration()
+            } else {
+              handleAuthInvalidation()
+            }
+          }.onFailure { meErr ->
+            if (isAuthError(meErr)) {
+              handleAuthInvalidation()
+            }
+          }
+        }.onFailure { refreshErr ->
+          if (isAuthError(refreshErr)) {
+            handleAuthInvalidation()
+          }
+        }
       }
     }
+  }
+
+  private fun isAuthError(err: Throwable): Boolean {
+    val msg = err.message ?: return false
+    return msg.startsWith("HTTP 401")
+  }
+
+  private fun handleAuthInvalidation() {
+    sessionStore.clearSession()
+    callController.clearSession()
+    CallGuardService.stop(getApplication())
+    _ui.value = UiState(
+      serverAddr = sessionStore.getServerAddr(),
+      ringtoneUri = sessionStore.getRingtoneUri(),
+      ringtoneVolume = sessionStore.getRingtoneVolume(),
+    )
+    deviceContacts = emptyList()
+    serverContacts = emptyList()
   }
 
   fun onForegroundChanged(foreground: Boolean) {

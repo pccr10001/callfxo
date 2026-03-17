@@ -493,7 +493,7 @@ func (s *Server) handleLogout(c *gin.Context) {
 func (s *Server) handleMe(c *gin.Context) {
 	sess, ok := s.sessionFromRequest(c)
 	if !ok {
-		c.JSON(200, gin.H{"authenticated": false})
+		c.JSON(401, gin.H{"error": "unauthorized"})
 		return
 	}
 	c.JSON(200, gin.H{

@@ -41,9 +41,10 @@ import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -371,6 +372,7 @@ private fun MainScreen(
   }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun DialTab(
   state: UiState,
@@ -381,42 +383,50 @@ private fun DialTab(
 ) {
   val selected = state.boxes.firstOrNull { it.id == state.selectedBoxId }
   val dialEnabled = selected != null && selected.online && !selected.inUse && state.dialNumber.isNotBlank() && !state.callBusy
+  var lineMenuExpanded by remember { mutableStateOf(false) }
   Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-    Text("FXO line", style = MaterialTheme.typography.titleMedium)
-    Spacer(Modifier.height(8.dp))
 
     if (state.boxes.isEmpty()) {
       Text("No FXO lines available", color = MaterialTheme.colorScheme.onSurfaceVariant)
     } else {
-      state.boxes.chunked(2).forEach { row ->
-        Row(
-          modifier = Modifier.fillMaxWidth(),
-          horizontalArrangement = Arrangement.spacedBy(8.dp),
+      ExposedDropdownMenuBox(
+        expanded = lineMenuExpanded,
+        onExpandedChange = { lineMenuExpanded = !lineMenuExpanded },
+      ) {
+        val selectedLabel = selected?.name ?: "Select a line"
+        OutlinedTextField(
+          value = selectedLabel,
+          onValueChange = {},
+          readOnly = true,
+          trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = lineMenuExpanded) },
+          modifier = Modifier
+            .fillMaxWidth()
+            .menuAnchor(),
+        )
+        ExposedDropdownMenu(
+          expanded = lineMenuExpanded,
+          onDismissRequest = { lineMenuExpanded = false },
         ) {
-          row.forEach { box ->
-            val selectedBox = box.id == state.selectedBoxId
+          state.boxes.forEach { box ->
             val status = when {
               box.inUse -> "In use"
               box.online -> "Ready"
               else -> "Offline"
             }
-            FilledTonalButton(
-              onClick = { onSelectBox(box.id) },
-              modifier = Modifier
-                .weight(1f)
-                .height(58.dp),
-            ) {
-              Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(if (selectedBox) "${box.name} *" else box.name, textAlign = TextAlign.Center)
-                Text(status, style = MaterialTheme.typography.labelSmall)
-              }
-            }
-          }
-          if (row.size < 2) {
-            Spacer(modifier = Modifier.weight(1f))
+            DropdownMenuItem(
+              text = {
+                Column {
+                  Text(box.name)
+                  Text(status, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+              },
+              onClick = {
+                onSelectBox(box.id)
+                lineMenuExpanded = false
+              },
+            )
           }
         }
-        Spacer(Modifier.height(8.dp))
       }
     }
 
@@ -426,16 +436,6 @@ private fun DialTab(
       selected.online -> "Selected line is ready"
       else -> "Selected line is offline"
     }
-
-    Spacer(Modifier.height(6.dp))
-    Text(
-      text = selected?.name ?: "No line selected",
-      style = MaterialTheme.typography.titleLarge,
-    )
-    Text(
-      text = selected?.sipUsername?.takeIf { it.isNotBlank() } ?: selectedStatus,
-      color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
 
     Spacer(Modifier.height(12.dp))
 

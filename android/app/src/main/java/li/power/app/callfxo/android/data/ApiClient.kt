@@ -6,8 +6,11 @@ import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -138,6 +141,7 @@ class ApiClient(private val sessionStore: SessionStore) {
     .readTimeout(20, TimeUnit.SECONDS)
     .writeTimeout(20, TimeUnit.SECONDS)
     .build()
+  private val refreshMutex = Mutex()
 
   suspend fun login(serverAddr: String, username: String, password: String): Result<UserDto> = runCatching {
     val base = normalizeServerAddr(serverAddr)
@@ -190,7 +194,9 @@ class ApiClient(private val sessionStore: SessionStore) {
     client.newCall(req).await().use {
       val raw = it.body?.string().orEmpty()
       if (!it.isSuccessful) {
-        sessionStore.clearSession()
+        if (it.code == 401) {
+          sessionStore.clearSession()
+        }
         throw IOException(extractError(raw, it.code))
       }
       val resp = json.decodeFromString(LoginResponse.serializer(), raw)
@@ -204,6 +210,10 @@ class ApiClient(private val sessionStore: SessionStore) {
       )
       resp.pushConfig?.let(sessionStore::savePushConfig)
     }
+  }
+
+  suspend fun refreshWithRetry(maxAttempts: Int = 3): Result<Unit> = refreshMutex.withLock {
+    refreshWithRetryInternal(maxAttempts)
   }
 
   suspend fun me(): Result<MeResponse> = authedGet("/api/me") { body ->
@@ -278,7 +288,7 @@ class ApiClient(private val sessionStore: SessionStore) {
     client.newCall(req).await().use { res ->
       val raw = res.body?.string().orEmpty()
       if (res.code == 401) {
-        refresh().getOrThrow()
+        refreshIfNeeded(session).getOrThrow()
         val refreshed = sessionStore.getSession() ?: throw IOException("refresh failed")
         val retry = Request.Builder()
           .url(refreshed.serverAddr + path)
@@ -305,6 +315,43 @@ class ApiClient(private val sessionStore: SessionStore) {
       }
       return raw
     }
+  }
+
+  private suspend fun refreshIfNeeded(session: SessionData): Result<Unit> = refreshMutex.withLock {
+    val current = sessionStore.getSession() ?: return@withLock Result.failure(IOException("not logged in"))
+    if (current.accessToken != session.accessToken) {
+      return@withLock Result.success(Unit)
+    }
+    refreshWithRetryInternal(3)
+  }
+
+  private suspend fun refreshWithRetryInternal(maxAttempts: Int): Result<Unit> {
+    val attempts = maxAttempts.coerceIn(1, 5)
+    var lastFailure: Result<Unit>? = null
+    repeat(attempts) { idx ->
+      val res = refresh()
+      if (res.isSuccess) return res
+      val err = res.exceptionOrNull()
+      if (err != null && isAuthError(err)) return res
+      lastFailure = res
+      if (idx < attempts - 1) {
+        delay(backoffDelayMs(idx))
+      }
+    }
+    return lastFailure ?: Result.failure(IOException("refresh failed"))
+  }
+
+  private fun backoffDelayMs(attemptIndex: Int): Long {
+    return when (attemptIndex) {
+      0 -> 250L
+      1 -> 800L
+      else -> 1500L
+    }
+  }
+
+  private fun isAuthError(err: Throwable): Boolean {
+    val msg = err.message ?: return false
+    return msg.startsWith("HTTP 401")
   }
 
   private fun normalizeServerAddr(input: String): String {
