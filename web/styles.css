@@ -213,6 +213,21 @@ button.alt {
   background: #202020;
 }
 
+.dial-keypad-wrap {
+  margin-top: 12px;
+}
+
+.dial-kpad button {
+  background: #f6ede4;
+  color: var(--ink);
+  border: 1px solid #ead9c8;
+  font-weight: 600;
+}
+
+.dial-kpad button:hover {
+  background: #efdfd0;
+}
+
 .hide {
   display: none !important;
 }
@@ -342,11 +357,25 @@ small {
 }
 
 .call-screen-sheet { width: min(560px, 94vw); }
-.call-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 18px; text-align: left; }
+.call-controls { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 18px; text-align: left; }
 .call-controls .level-title { margin-top: 0; }
 .call-controls .kpad { margin-top: 8px; }
 .call-controls .level-wrap { margin: 0; }
-.call-actions { margin-top: 18px; }
+.call-keypad {
+  margin-top: 18px;
+  text-align: left;
+}
+.call-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.call-actions > * {
+  width: 100%;
+  max-width: none !important;
+}
 
 .call-label {
   color: var(--muted);
@@ -366,10 +395,6 @@ small {
   font-family: "Space Grotesk", "Noto Sans TC", sans-serif;
   font-size: 40px;
   font-weight: 700;
-}
-
-@media (max-width: 600px) {
-  .call-controls { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 900px) {

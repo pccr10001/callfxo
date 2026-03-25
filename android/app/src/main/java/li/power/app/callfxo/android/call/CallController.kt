@@ -66,6 +66,10 @@ class CallController(
   private val apiClient: ApiClient,
   private val notificationManager: CallNotificationManager,
 ) {
+  companion object {
+    private const val TAG = "CallController"
+  }
+
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
   private val refreshMutex = Mutex()
@@ -78,6 +82,7 @@ class CallController(
   private var reconnectJob: Job? = null
   private var iceDisconnectJob: Job? = null
   private var ringtonePlayer: MediaPlayer? = null
+  private val pendingRemoteCandidates = mutableListOf<IceCandidate>()
 
   private var appForeground = false
   private var callActive = false
@@ -499,10 +504,13 @@ class CallController(
       "answer" -> {
         val sdp = msg.optString("sdp")
         if (sdp.isNotBlank()) {
+          Log.i(TAG, "Received remote answer, sdpLength=${sdp.length}")
           scope.launch {
             try {
               val pc = peerConnection ?: return@launch
               pc.awaitSetRemote(SessionDescription(SessionDescription.Type.ANSWER, sdp))
+              Log.i(TAG, "Remote answer applied successfully")
+              flushPendingRemoteCandidates(pc)
               callActive = true
               outgoingSignalStarted = false
               _callBusy.value = true
@@ -522,16 +530,38 @@ class CallController(
       }
       "candidate" -> {
         val c = msg.optJSONObject("candidate") ?: return
+        val sdpMLineIndex = c.optInt("sdpMLineIndex")
+        val sdpMid = c.optString("sdpMid").trim().ifBlank {
+          if (sdpMLineIndex >= 0) sdpMLineIndex.toString() else "0"
+        }
         val cand = IceCandidate(
-          c.optString("sdpMid"),
-          c.optInt("sdpMLineIndex"),
+          sdpMid,
+          sdpMLineIndex,
           c.optString("candidate"),
         )
-        peerConnection?.addIceCandidate(cand)
+        Log.i(
+          TAG,
+          "Remote ICE candidate: mid=${cand.sdpMid} mline=${cand.sdpMLineIndex} candidate=${cand.sdp}"
+        )
+        val pc = peerConnection
+        if (pc == null) {
+          Log.w(TAG, "Remote ICE candidate dropped because peerConnection is null")
+          return
+        }
+        if (pc.remoteDescription == null) {
+          synchronized(pendingRemoteCandidates) {
+            pendingRemoteCandidates += cand
+          }
+          Log.i(TAG, "Remote ICE candidate queued until remote description is set")
+          return
+        }
+        val added = pc.addIceCandidate(cand)
+        Log.i(TAG, "Remote ICE candidate add result: $added")
       }
       "state" -> {
         val st = msg.optString("state")
         val detail = msg.optString("detail")
+        Log.i(TAG, "Signal state message: state=$st detail=$detail")
         _callStatus.value = if (detail.isNotBlank()) "$st ($detail)" else st
         _events.tryEmit("call_changed")
         when (st) {
@@ -559,6 +589,7 @@ class CallController(
       }
       "hangup" -> {
         val reason = msg.optString("reason", "hangup")
+        Log.i(TAG, "Hangup received: $reason")
         if (hasOngoingCall()) {
           endCall(reason, disconnectCause = disconnectCauseFor(reason))
         } else {
@@ -595,6 +626,7 @@ class CallController(
       }
       "error" -> {
         val errorMessage = msg.optString("error").ifBlank { "signaling error" }
+        Log.w(TAG, "Signal error message: $errorMessage")
         if (hasOngoingCall()) {
           endCall("error: $errorMessage", disconnectCause = DisconnectCause.ERROR)
         } else {
@@ -710,6 +742,7 @@ class CallController(
     val pc = createPeerConnection()
     val offer = pc.awaitCreateOffer()
     pc.awaitSetLocal(offer)
+    Log.i(TAG, "Local offer created, sdpLength=${offer.description.length}")
     return offer.description
   }
 
@@ -731,6 +764,7 @@ class CallController(
       override fun onSignalingChange(newState: PeerConnection.SignalingState?) = Unit
 
       override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
+        Log.i(TAG, "ICE connection state changed: $newState")
         if (!callActive && peerConnection == null) return
         when (newState) {
           PeerConnection.IceConnectionState.CONNECTED,
@@ -762,6 +796,10 @@ class CallController(
 
       override fun onIceCandidate(candidate: IceCandidate?) {
         if (candidate == null) return
+        Log.i(
+          TAG,
+          "Local ICE candidate: mid=${candidate.sdpMid} mline=${candidate.sdpMLineIndex} candidate=${candidate.sdp}"
+        )
         val cand = JSONObject()
           .put("sdpMid", candidate.sdpMid)
           .put("sdpMLineIndex", candidate.sdpMLineIndex)
@@ -831,7 +869,7 @@ class CallController(
 
   private fun buildIceServers(): List<PeerConnection.IceServer> {
     val cfg = sessionStore.getWebRTCConfig() ?: return emptyList()
-    return cfg.iceServers
+    val servers = cfg.iceServers
       .asSequence()
       .flatMap { server ->
         server.urls
@@ -850,6 +888,8 @@ class CallController(
           }
       }
       .toList()
+    Log.i(TAG, "Configured ICE servers: count=${servers.size} urls=${servers.joinToString { it.urls.joinToString() }}")
+    return servers
   }
 
   private fun prepareOutgoingState(request: OutgoingCallRequest) {
@@ -952,6 +992,9 @@ class CallController(
   private fun closePeer() {
     iceDisconnectJob?.cancel()
     iceDisconnectJob = null
+    synchronized(pendingRemoteCandidates) {
+      pendingRemoteCandidates.clear()
+    }
     val pc = peerConnection
     peerConnection = null
     try {
@@ -1100,6 +1143,20 @@ class CallController(
 
   private fun firstNonBlank(vararg values: String): String {
     return values.firstOrNull { it.isNotBlank() }.orEmpty()
+  }
+
+  private fun flushPendingRemoteCandidates(pc: PeerConnection) {
+    val pending = synchronized(pendingRemoteCandidates) {
+      val copied = pendingRemoteCandidates.toList()
+      pendingRemoteCandidates.clear()
+      copied
+    }
+    if (pending.isEmpty()) return
+    Log.i(TAG, "Flushing queued remote ICE candidates: count=${pending.size}")
+    pending.forEach { cand ->
+      val added = pc.addIceCandidate(cand)
+      Log.i(TAG, "Flushed remote ICE candidate add result: $added candidate=${cand.sdp}")
+    }
   }
 }
 

@@ -315,6 +315,7 @@ const state = {
   firebaseApp: null,
   firebaseMessaging: null,
   webrtcConfig: { ice_servers: [] },
+  pendingRemoteCandidates: [],
   lang: resolveInitialLang(),
 };
 
@@ -418,6 +419,19 @@ function setDialNumber(number) {
 function appendDialDigit(digit) {
   if (!dialNumberInput) return;
   dialNumberInput.value = `${dialNumberInput.value || ''}${digit}`;
+}
+
+function normalizeRemoteCandidate(candidate) {
+  if (!candidate) return null;
+  const normalized = { ...candidate };
+  const rawMid = normalized.sdpMid;
+  const rawIndex = normalized.sdpMLineIndex;
+  const hasMid = !(rawMid == null || String(rawMid).trim() === '');
+  const index = Number(rawIndex);
+  if (!hasMid && Number.isFinite(index) && index >= 0) {
+    normalized.sdpMid = String(index);
+  }
+  return normalized;
 }
 
 function setCallPeer(name, meta = '') {
@@ -1134,6 +1148,7 @@ function connectWS() {
       case 'answer':
         if (state.pc) {
           await state.pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+          await flushPendingRemoteCandidates();
           setText(callStatus, t('call.connected'));
           state.active = true;
           hideIncomingDialog();
@@ -1144,7 +1159,13 @@ function connectWS() {
         break;
       case 'candidate':
         if (state.pc && msg.candidate) {
-          try { await state.pc.addIceCandidate(msg.candidate); } catch (_) {}
+          const candidate = normalizeRemoteCandidate(msg.candidate);
+          if (!candidate) break;
+          if (!state.pc.remoteDescription) {
+            state.pendingRemoteCandidates.push(candidate);
+          } else {
+            try { await state.pc.addIceCandidate(candidate); } catch (_) {}
+          }
         }
         break;
       case 'state': {
@@ -1247,6 +1268,18 @@ function teardownRemoteAudio() {
   }
 }
 
+async function flushPendingRemoteCandidates() {
+  if (!state.pc || !state.pendingRemoteCandidates.length) return;
+  const pending = state.pendingRemoteCandidates.splice(0, state.pendingRemoteCandidates.length);
+  for (const candidate of pending) {
+    try {
+      const normalized = normalizeRemoteCandidate(candidate);
+      if (!normalized) continue;
+      await state.pc.addIceCandidate(normalized);
+    } catch (_) {}
+  }
+}
+
 function stopLocalMedia() {
   if (!state.localStream) return;
   state.localStream.getTracks().forEach((t) => {
@@ -1297,6 +1330,7 @@ async function startDial() {
 
   const pc = new RTCPeerConnection({ iceServers: state.webrtcConfig.ice_servers || [] });
   state.pc = pc;
+  state.pendingRemoteCandidates = [];
   state.callMode = 'outgoing';
   const selectedBox = state.boxes.find((box) => Number(box.id) === boxId);
   setCallPeer(number, selectedBox ? selectedBox.name : '');
@@ -1355,6 +1389,7 @@ async function acceptIncomingCall() {
 
   const pc = new RTCPeerConnection({ iceServers: state.webrtcConfig.ice_servers || [] });
   state.pc = pc;
+  state.pendingRemoteCandidates = [];
   state.callMode = 'incoming';
   setCallPeer(incoming.caller_id || incoming.remote_number || 'Unknown', incoming.box_name || '');
 
@@ -1396,6 +1431,7 @@ function cleanupPeer(sendHangup) {
   }
   state.active = false;
   state.callMode = '';
+  state.pendingRemoteCandidates = [];
   setMuted(false);
   showCallScreen(false);
   teardownRemoteAudio();
@@ -1595,8 +1631,14 @@ function bindEvents() {
       if (!d) return;
       if (state.active && state.ws && state.ws.readyState === WebSocket.OPEN) {
         state.ws.send(JSON.stringify({ type: 'dtmf', digits: d }));
-        return;
       }
+    };
+  });
+
+  document.querySelectorAll('#dialKpad button').forEach((btn) => {
+    btn.onclick = () => {
+      const d = btn.dataset.digit;
+      if (!d) return;
       appendDialDigit(d);
     };
   });

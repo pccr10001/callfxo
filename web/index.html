@@ -102,6 +102,14 @@
           <select id="dialBox"></select>
           <label data-i18n="dial.numberLabel">電話號碼</label>
           <input id="dialNumber" data-i18n-ph="dial.ph.number" placeholder="例如 0912345678" />
+          <div class="dial-keypad-wrap">
+            <div class="kpad dial-kpad" id="dialKpad">
+              <button type="button" data-digit="1">1</button><button type="button" data-digit="2">2</button><button type="button" data-digit="3">3</button>
+              <button type="button" data-digit="4">4</button><button type="button" data-digit="5">5</button><button type="button" data-digit="6">6</button>
+              <button type="button" data-digit="7">7</button><button type="button" data-digit="8">8</button><button type="button" data-digit="9">9</button>
+              <button type="button" data-digit="*">*</button><button type="button" data-digit="0">0</button><button type="button" data-digit="#">#</button>
+            </div>
+          </div>
           <div class="row" style="margin-top:10px;">
             <button id="dialBtn" class="alt" data-i18n="dial.button">撥號</button>
             <button id="hangupBtn" class="warn" data-i18n="dial.hangup">掛斷</button>
@@ -186,14 +194,14 @@
           <div class="level-title"><span id="volumeLabel" data-i18n="audio.volume">播放音量</span> <span id="volumeValue">100%</span></div>
           <input id="volumeSlider" type="range" min="0" max="100" step="1" value="100" />
         </div>
-        <div class="call-keypad">
-          <div class="level-title">DTMF</div>
-          <div class="kpad call-kpad" id="kpad">
-            <button data-dtmf="1">1</button><button data-dtmf="2">2</button><button data-dtmf="3">3</button>
-            <button data-dtmf="4">4</button><button data-dtmf="5">5</button><button data-dtmf="6">6</button>
-            <button data-dtmf="7">7</button><button data-dtmf="8">8</button><button data-dtmf="9">9</button>
-            <button data-dtmf="*">*</button><button data-dtmf="0">0</button><button data-dtmf="#">#</button>
-          </div>
+      </div>
+      <div class="call-keypad">
+        <div class="level-title">DTMF</div>
+        <div class="kpad call-kpad" id="kpad">
+          <button type="button" data-dtmf="1">1</button><button type="button" data-dtmf="2">2</button><button type="button" data-dtmf="3">3</button>
+          <button type="button" data-dtmf="4">4</button><button type="button" data-dtmf="5">5</button><button type="button" data-dtmf="6">6</button>
+          <button type="button" data-dtmf="7">7</button><button type="button" data-dtmf="8">8</button><button type="button" data-dtmf="9">9</button>
+          <button type="button" data-dtmf="*">*</button><button type="button" data-dtmf="0">0</button><button type="button" data-dtmf="#">#</button>
         </div>
       </div>
       <div class="row call-actions" style="margin-top: 18px;">
