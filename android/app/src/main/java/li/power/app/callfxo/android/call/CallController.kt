@@ -724,7 +724,7 @@ class CallController(
     val current = peerConnection
     if (current != null) return current
 
-    val rtcConfig = PeerConnection.RTCConfiguration(emptyList())
+    val rtcConfig = PeerConnection.RTCConfiguration(buildIceServers())
     rtcConfig.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
 
     val pc = factory!!.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
@@ -825,6 +825,29 @@ class CallController(
         val mime = it.mimeType?.trim().orEmpty().lowercase()
         val name = it.name?.trim().orEmpty().lowercase()
         mime == "audio/pcmu" || name == "pcmu"
+      }
+      .toList()
+  }
+
+  private fun buildIceServers(): List<PeerConnection.IceServer> {
+    val cfg = sessionStore.getWebRTCConfig() ?: return emptyList()
+    return cfg.iceServers
+      .asSequence()
+      .flatMap { server ->
+        server.urls
+          .asSequence()
+          .map { url -> url.trim() }
+          .filter { it.isNotBlank() }
+          .map { url ->
+            PeerConnection.IceServer.builder(url).apply {
+              if (server.username.isNotBlank()) {
+                setUsername(server.username)
+              }
+              if (server.credential.isNotBlank()) {
+                setPassword(server.credential)
+              }
+            }.createIceServer()
+          }
       }
       .toList()
   }

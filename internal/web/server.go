@@ -2,7 +2,9 @@ package web
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -66,6 +68,16 @@ type wsClient struct {
 type boxRuntimeState struct {
 	Online bool
 	InUse  bool
+}
+
+type webRTCICEServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
+
+type webRTCConfigResponse struct {
+	ICEServers []webRTCICEServer `json:"ice_servers"`
 }
 
 func (c *wsClient) Send(v any) error {
@@ -415,6 +427,7 @@ func (s *Server) handleLogin(c *gin.Context) {
 		"refresh_expires_at": refreshExpiresAt,
 		"device_token":       deviceToken,
 		"push_config":        s.push.PublicConfig(),
+		"webrtc_config":      s.publicWebRTCConfig(deviceToken),
 	})
 }
 
@@ -479,6 +492,7 @@ func (s *Server) handleRefresh(c *gin.Context) {
 		"refresh_expires_at": refreshExpiresAt,
 		"device_token":       dev.DeviceToken,
 		"push_config":        s.push.PublicConfig(),
+		"webrtc_config":      s.publicWebRTCConfig(dev.DeviceToken),
 	})
 }
 
@@ -500,6 +514,7 @@ func (s *Server) handleMe(c *gin.Context) {
 		"authenticated": true,
 		"user":          gin.H{"id": sess.UserID, "username": sess.Username, "role": sess.Role},
 		"device_token":  sess.DeviceToken,
+		"webrtc_config": s.publicWebRTCConfig(sess.DeviceToken),
 	})
 }
 
@@ -1299,6 +1314,68 @@ func clearCookie(c *gin.Context, name string) {
 		MaxAge:   -1,
 		Expires:  time.Unix(0, 0),
 	})
+}
+
+func (s *Server) publicWebRTCConfig(subject string) webRTCConfigResponse {
+	servers := make([]webRTCICEServer, 0, 2)
+	stunURLs := trimNonBlankList(s.cfg.Media.ICESTUNURLs)
+	if len(stunURLs) > 0 {
+		servers = append(servers, webRTCICEServer{URLs: stunURLs})
+	}
+
+	turnURLs := trimNonBlankList(s.cfg.Media.ICETURNURLs)
+	if len(turnURLs) > 0 {
+		username, credential := s.turnCredentials(subject)
+		turnServer := webRTCICEServer{
+			URLs:       turnURLs,
+			Username:   username,
+			Credential: credential,
+		}
+		servers = append(servers, turnServer)
+	}
+
+	return webRTCConfigResponse{ICEServers: servers}
+}
+
+func (s *Server) turnCredentials(subject string) (string, string) {
+	sharedSecret := strings.TrimSpace(s.cfg.Media.ICETURNSharedSecret)
+	if sharedSecret != "" {
+		ttl := time.Duration(s.cfg.Media.ICETURNCredentialTTLMinute) * time.Minute
+		if ttl <= 0 {
+			ttl = time.Duration(config.Default().Media.ICETURNCredentialTTLMinute) * time.Minute
+		}
+		return buildTURNCredentials(sharedSecret, normalizeTurnSubject(subject), ttl)
+	}
+	return strings.TrimSpace(s.cfg.Media.ICETURNUsername), strings.TrimSpace(s.cfg.Media.ICETURNCredential)
+}
+
+func buildTURNCredentials(secret, subject string, ttl time.Duration) (string, string) {
+	exp := time.Now().Add(ttl).Unix()
+	username := fmt.Sprintf("%d:%s", exp, subject)
+	mac := hmac.New(sha1.New, []byte(secret))
+	_, _ = mac.Write([]byte(username))
+	credential := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	return username, credential
+}
+
+func normalizeTurnSubject(subject string) string {
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return "anonymous"
+	}
+	return strings.ReplaceAll(subject, ":", "_")
+}
+
+func trimNonBlankList(items []string) []string {
+	out := make([]string, 0, len(items))
+	for _, raw := range items {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
 }
 
 func isSecureRequest(c *gin.Context) bool {

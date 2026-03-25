@@ -137,75 +137,64 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
       serverAddr = s.serverAddr,
       username = s.username,
       usernameInput = s.username,
-      loggedIn = true,
+      loading = true,
       loginError = null,
     )
-    callController.onSessionChanged()
 
     viewModelScope.launch {
-      api.me().onSuccess { me ->
-        if (me.authenticated && me.user != null) {
-          _ui.value = _ui.value.copy(
-            loggedIn = true,
-            username = me.user.username,
-            role = me.user.role,
-            loginError = null,
-          )
-          refreshAll()
-          syncPushRegistration()
-        } else {
-          api.refreshWithRetry().onSuccess {
-            api.me().onSuccess { refreshedMe ->
-              if (refreshedMe.authenticated && refreshedMe.user != null) {
-                _ui.value = _ui.value.copy(
-                  loggedIn = true,
-                  username = refreshedMe.user.username,
-                  role = refreshedMe.user.role,
-                  loginError = null,
-                )
-                refreshAll()
-                syncPushRegistration()
-              } else {
-                handleAuthInvalidation()
-              }
-            }.onFailure { meErr ->
-              if (isAuthError(meErr)) {
-                handleAuthInvalidation()
-              }
-            }
-          }.onFailure { refreshErr ->
-            if (isAuthError(refreshErr)) {
-              handleAuthInvalidation()
-            }
-          }
+      val meResult = api.me()
+      if (meResult.isSuccess) {
+        val me = meResult.getOrNull()
+        if (me != null && me.authenticated && me.user != null) {
+          onSessionRestored(me.user.username, me.user.role)
+          return@launch
         }
-      }.onFailure {
-        api.refreshWithRetry().onSuccess {
-          api.me().onSuccess { me ->
-            if (me.authenticated && me.user != null) {
-              _ui.value = _ui.value.copy(
-                loggedIn = true,
-                username = me.user.username,
-                role = me.user.role,
-                loginError = null,
-              )
-              refreshAll()
-              syncPushRegistration()
-            } else {
-              handleAuthInvalidation()
-            }
-          }.onFailure { meErr ->
-            if (isAuthError(meErr)) {
-              handleAuthInvalidation()
-            }
-          }
-        }.onFailure { refreshErr ->
-          if (isAuthError(refreshErr)) {
-            handleAuthInvalidation()
-          }
+      }
+
+      val meErr = meResult.exceptionOrNull()
+      if (meErr != null && !isAuthError(meErr)) {
+        _ui.value = _ui.value.copy(loading = false, loginError = meErr.message)
+        return@launch
+      }
+
+      val refreshResult = api.refreshWithRetry()
+      if (refreshResult.isFailure) {
+        val refreshErr = refreshResult.exceptionOrNull()
+        if (refreshErr != null && isAuthError(refreshErr)) {
+          handleAuthInvalidation()
+        } else {
+          _ui.value = _ui.value.copy(loading = false, loginError = refreshErr?.message)
+        }
+        return@launch
+      }
+
+      api.me().onSuccess { refreshedMe ->
+        if (refreshedMe.authenticated && refreshedMe.user != null) {
+          onSessionRestored(refreshedMe.user.username, refreshedMe.user.role)
+        } else {
+          handleAuthInvalidation()
+        }
+      }.onFailure { refreshedMeErr ->
+        if (isAuthError(refreshedMeErr)) {
+          handleAuthInvalidation()
+        } else {
+          _ui.value = _ui.value.copy(loading = false, loginError = refreshedMeErr.message)
         }
       }
     }
+  }
+
+  private fun onSessionRestored(username: String, role: String) {
+    _ui.value = _ui.value.copy(
+      loggedIn = true,
+      loading = false,
+      username = username,
+      role = role,
+      loginError = null,
+    )
+    callController.onSessionChanged()
+    refreshAll()
+    syncPushRegistration()
   }
 
   private fun isAuthError(err: Throwable): Boolean {

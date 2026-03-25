@@ -109,17 +109,6 @@
           <div id="callStatus" class="status" data-i18n="dial.idle">未通話</div>
           <div class="status" id="wsStatus" data-i18n="ws.disconnected">WebSocket: 未連線</div>
 
-          <div class="level-wrap">
-            <div class="level-title"><span id="volumeLabel" data-i18n="audio.volume">播放音量</span> <span id="volumeValue">100%</span></div>
-            <input id="volumeSlider" type="range" min="0" max="100" step="1" value="100" />
-          </div>
-
-          <div class="kpad" id="kpad">
-            <button data-dtmf="1">1</button><button data-dtmf="2">2</button><button data-dtmf="3">3</button>
-            <button data-dtmf="4">4</button><button data-dtmf="5">5</button><button data-dtmf="6">6</button>
-            <button data-dtmf="7">7</button><button data-dtmf="8">8</button><button data-dtmf="9">9</button>
-            <button data-dtmf="*">*</button><button data-dtmf="0">0</button><button data-dtmf="#">#</button>
-          </div>
         </div>
 
         <div class="panel split-panel">
@@ -187,12 +176,27 @@
   </div>
 
   <div id="callScreen" class="call-overlay hide">
-    <div class="call-sheet">
+    <div class="call-sheet call-screen-sheet">
       <div class="call-label">Active Call</div>
       <h2 id="callPeerName">Unknown</h2>
       <div class="call-sub" id="callPeerMeta">FXO</div>
       <div class="call-timer" id="callTimer">00:00</div>
-      <div class="row" style="margin-top: 18px;">
+      <div class="call-controls">
+        <div class="level-wrap">
+          <div class="level-title"><span id="volumeLabel" data-i18n="audio.volume">播放音量</span> <span id="volumeValue">100%</span></div>
+          <input id="volumeSlider" type="range" min="0" max="100" step="1" value="100" />
+        </div>
+        <div class="call-keypad">
+          <div class="level-title">DTMF</div>
+          <div class="kpad call-kpad" id="kpad">
+            <button data-dtmf="1">1</button><button data-dtmf="2">2</button><button data-dtmf="3">3</button>
+            <button data-dtmf="4">4</button><button data-dtmf="5">5</button><button data-dtmf="6">6</button>
+            <button data-dtmf="7">7</button><button data-dtmf="8">8</button><button data-dtmf="9">9</button>
+            <button data-dtmf="*">*</button><button data-dtmf="0">0</button><button data-dtmf="#">#</button>
+          </div>
+        </div>
+      </div>
+      <div class="row call-actions" style="margin-top: 18px;">
         <button id="muteBtn" class="alt" style="max-width: 180px;">靜音</button>
         <button id="callScreenHangupBtn" class="warn" style="max-width: 180px;">掛斷</button>
       </div>

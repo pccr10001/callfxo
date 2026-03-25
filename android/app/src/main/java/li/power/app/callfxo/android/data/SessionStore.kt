@@ -21,6 +21,18 @@ data class PushConfigData(
   val vapid_key: String = "",
 )
 
+@Serializable
+data class WebRTCIceServerData(
+  val urls: List<String> = emptyList(),
+  val username: String = "",
+  val credential: String = "",
+)
+
+@Serializable
+data class WebRTCConfigData(
+  @SerialName("ice_servers") val iceServers: List<WebRTCIceServerData> = emptyList(),
+)
+
 data class SessionData(
   val serverAddr: String,
   val username: String,
@@ -86,6 +98,16 @@ class SessionStore(context: Context) {
     return runCatching { json.decodeFromString(PushConfigData.serializer(), raw) }.getOrNull()
   }
 
+  fun saveWebRTCConfig(config: WebRTCConfigData) {
+    prefs.edit().putString(KEY_WEBRTC_CONFIG, json.encodeToString(WebRTCConfigData.serializer(), config)).apply()
+  }
+
+  fun getWebRTCConfig(): WebRTCConfigData? {
+    val raw = prefs.getString(KEY_WEBRTC_CONFIG, "")?.trim().orEmpty()
+    if (raw.isBlank()) return null
+    return runCatching { json.decodeFromString(WebRTCConfigData.serializer(), raw) }.getOrNull()
+  }
+
   fun saveRingtoneUri(uri: String?) {
     val normalized = (uri ?: "").trim()
     prefs.edit().putString(KEY_RINGTONE_URI, normalized.ifBlank { defaultRingtoneUri }).apply()
@@ -111,6 +133,7 @@ class SessionStore(context: Context) {
       .remove(KEY_ACCESS_TOKEN)
       .remove(KEY_REFRESH_TOKEN)
       .remove(KEY_PUSH_CONFIG)
+      .remove(KEY_WEBRTC_CONFIG)
       .apply()
   }
 
@@ -121,6 +144,7 @@ class SessionStore(context: Context) {
     private const val KEY_REFRESH_TOKEN = "refresh_token"
     private const val KEY_DEVICE_TOKEN = "device_token"
     private const val KEY_PUSH_CONFIG = "push_config"
+    private const val KEY_WEBRTC_CONFIG = "webrtc_config"
     private const val KEY_RINGTONE_URI = "ringtone_uri"
     private const val KEY_RINGTONE_VOLUME = "ringtone_volume"
   }

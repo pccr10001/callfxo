@@ -6,6 +6,7 @@ It provides:
 - SIP registrar for FXO boxes (REGISTER)
 - SIP UAC call control for outbound INVITE to a selected FXO box
 - WebRTC audio bridge in the browser (PCMU passthrough)
+- Optional TURN / TURNS ICE server support for NAT traversal
 - Web UI for users, FXO boxes, dialing, DTMF, call logs, and personal contacts
 - Password change:
   - user can change only their own password
@@ -45,6 +46,7 @@ cp config.yaml.example config.yaml
   - `sip.advertised_ip` and `media.public_ip` to the IP reachable by FXO boxes and browsers
   - `database.path` to your SQLite file
   - `auth.access_ttl_minutes` / `auth.refresh_ttl_hours` to your desired session lifetime
+  - `media.ice_stun_urls` and optionally `media.ice_turn_urls` for browser / app ICE traversal
   - `fcm.*` only if you want Android / browser push notifications
 
 3. Start server:
@@ -116,6 +118,14 @@ media:
   public_ip: "192.168.26.160"
   ice_stun_urls:
     - "stun:stun.l.google.com:19302"
+  ice_turn_urls:
+    - "turn:turn.example.com:3478?transport=udp"
+    - "turn:turn.example.com:3478?transport=tcp"
+    - "turns:turn.example.com:5349?transport=tcp"
+  ice_turn_username: ""
+  ice_turn_credential: ""
+  ice_turn_shared_secret: ""
+  ice_turn_credential_ttl_minutes: 60
 
 database:
   path: "./callfxo.db"
@@ -139,6 +149,19 @@ fcm:
 ```
 
 Use `config.yaml.example` as the authoritative template. Legacy `auth.session_ttl_hours` is still read for compatibility, but new deployments should use `access_ttl_minutes` and `refresh_ttl_hours`.
+
+## TURN / TURNS
+
+For double-NAT or restrictive network environments, configure TURN or TURNS in `media.ice_turn_urls`.
+
+CallFXO supports both:
+
+- fixed TURN credentials via `media.ice_turn_username` / `media.ice_turn_credential`
+- coturn shared-secret dynamic credentials via `media.ice_turn_shared_secret`
+
+If `media.ice_turn_shared_secret` is set, CallFXO generates short-lived credentials for Web and Android clients automatically.
+
+An example coturn deployment is included in [coturn/README.md](/C:/Users/pccr10001/go/src/github.com/pccr10001/callfxo/coturn/README.md).
 
 ## FCM Push
 

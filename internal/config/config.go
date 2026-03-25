@@ -32,9 +32,14 @@ type SIPConfig struct {
 }
 
 type MediaConfig struct {
-	RTPBindIP   string   `yaml:"rtp_bind_ip"`
-	PublicIP    string   `yaml:"public_ip"`
-	ICESTUNURLs []string `yaml:"ice_stun_urls"`
+	RTPBindIP                  string   `yaml:"rtp_bind_ip"`
+	PublicIP                   string   `yaml:"public_ip"`
+	ICESTUNURLs                []string `yaml:"ice_stun_urls"`
+	ICETURNURLs                []string `yaml:"ice_turn_urls"`
+	ICETURNUsername            string   `yaml:"ice_turn_username"`
+	ICETURNCredential          string   `yaml:"ice_turn_credential"`
+	ICETURNSharedSecret        string   `yaml:"ice_turn_shared_secret"`
+	ICETURNCredentialTTLMinute int      `yaml:"ice_turn_credential_ttl_minutes"`
 }
 
 type DatabaseConfig struct {
@@ -82,9 +87,14 @@ func Default() Config {
 			NonceTTLHours: 1,
 		},
 		Media: MediaConfig{
-			RTPBindIP:   "0.0.0.0",
-			PublicIP:    "127.0.0.1",
-			ICESTUNURLs: []string{"stun:stun.l.google.com:19302"},
+			RTPBindIP:                  "0.0.0.0",
+			PublicIP:                   "127.0.0.1",
+			ICESTUNURLs:                []string{"stun:stun.l.google.com:19302"},
+			ICETURNURLs:                []string{},
+			ICETURNUsername:            "",
+			ICETURNCredential:          "",
+			ICETURNSharedSecret:        "",
+			ICETURNCredentialTTLMinute: 60,
 		},
 		Database: DatabaseConfig{Path: "./callfxo.db"},
 		Auth: AuthConfig{
@@ -158,6 +168,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Auth.RefreshTTLHours <= 0 {
 		cfg.Auth.RefreshTTLHours = Default().Auth.RefreshTTLHours
+	}
+	if cfg.Media.ICETURNCredentialTTLMinute <= 0 {
+		cfg.Media.ICETURNCredentialTTLMinute = Default().Media.ICETURNCredentialTTLMinute
 	}
 	return cfg, nil
 }

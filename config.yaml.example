@@ -15,6 +15,16 @@ media:
   public_ip: "192.168.1.33"
   ice_stun_urls:
     - "stun:stun.l.google.com:19302"
+  # Optional TURN / TURNS URLs. You can mix turn: and turns: here.
+  ice_turn_urls:
+    - "turn:turn.example.com:3478?transport=udp"
+    - "turn:turn.example.com:3478?transport=tcp"
+    - "turns:turn.example.com:5349?transport=tcp"
+  # Use either fixed username/credential, or set ice_turn_shared_secret for coturn dynamic credentials.
+  ice_turn_username: ""
+  ice_turn_credential: ""
+  ice_turn_shared_secret: ""
+  ice_turn_credential_ttl_minutes: 60
 
 database:
   path: "./callfxo.db"

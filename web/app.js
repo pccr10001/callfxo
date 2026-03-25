@@ -314,6 +314,7 @@ const state = {
   pushConfig: null,
   firebaseApp: null,
   firebaseMessaging: null,
+  webrtcConfig: { ice_servers: [] },
   lang: resolveInitialLang(),
 };
 
@@ -695,7 +696,9 @@ async function refreshAccessToken() {
   if (!res.ok) {
     throw new Error('refresh failed');
   }
-  return res.json().catch(() => ({}));
+  const data = await res.json().catch(() => ({}));
+  applySessionMeta(data);
+  return data;
 }
 
 async function api(path, options = {}, allowRefresh = true) {
@@ -742,15 +745,47 @@ function roleLabel(role) {
   return r === 'admin' ? t('role.admin') : t('role.user');
 }
 
+function normalizeWebRTCConfig(raw) {
+  const input = raw && typeof raw === 'object' ? raw : {};
+  const servers = Array.isArray(input.ice_servers) ? input.ice_servers : [];
+  return {
+    ice_servers: servers
+      .map((item) => {
+        const urls = Array.isArray(item?.urls)
+          ? item.urls.map((v) => String(v || '').trim()).filter(Boolean)
+          : [];
+        if (!urls.length) return null;
+        const normalized = { urls };
+        if (typeof item?.username === 'string' && item.username.trim()) {
+          normalized.username = item.username.trim();
+        }
+        if (typeof item?.credential === 'string' && item.credential.trim()) {
+          normalized.credential = item.credential.trim();
+        }
+        return normalized;
+      })
+      .filter(Boolean),
+  };
+}
+
+function applySessionMeta(data) {
+  if (!data || typeof data !== 'object') return;
+  if (data.device_token) {
+    state.deviceToken = data.device_token || state.deviceToken;
+  }
+  state.webrtcConfig = normalizeWebRTCConfig(data.webrtc_config);
+}
+
 async function checkMe() {
   try {
     const data = await api('/api/me');
     if (data.authenticated) {
       state.me = data.user;
-      state.deviceToken = data.device_token || state.deviceToken;
+      applySessionMeta(data);
       showApp(true);
       await initAuthed();
     } else {
+      state.webrtcConfig = { ice_servers: [] };
       stopCallLogPolling();
       if (state.contactSearchTimer) clearTimeout(state.contactSearchTimer);
       state.contactSearchTimer = null;
@@ -769,6 +804,7 @@ async function checkMe() {
       setText(loginMsg, t('login.prompt'));
     }
   } catch (_) {
+    state.webrtcConfig = { ice_servers: [] };
     stopCallLogPolling();
     if (state.contactSearchTimer) clearTimeout(state.contactSearchTimer);
     state.contactSearchTimer = null;
@@ -1259,7 +1295,7 @@ async function startDial() {
     await audioCtx.resume();
   }
 
-  const pc = new RTCPeerConnection();
+  const pc = new RTCPeerConnection({ iceServers: state.webrtcConfig.ice_servers || [] });
   state.pc = pc;
   state.callMode = 'outgoing';
   const selectedBox = state.boxes.find((box) => Number(box.id) === boxId);
@@ -1317,7 +1353,7 @@ async function acceptIncomingCall() {
     await audioCtx.resume();
   }
 
-  const pc = new RTCPeerConnection();
+  const pc = new RTCPeerConnection({ iceServers: state.webrtcConfig.ice_servers || [] });
   state.pc = pc;
   state.callMode = 'incoming';
   setCallPeer(incoming.caller_id || incoming.remote_number || 'Unknown', incoming.box_name || '');
@@ -1390,7 +1426,7 @@ function bindEvents() {
       }, false);
       setText(loginMsg, t('login.success'));
       state.me = res.user || { username, role: 'user' };
-      state.deviceToken = res.device_token || state.deviceToken;
+      applySessionMeta(res);
       showApp(true);
       await initAuthed();
     } catch (e) {
@@ -1408,6 +1444,7 @@ function bindEvents() {
     if (state.contactSearchTimer) clearTimeout(state.contactSearchTimer);
     state.contactSearchTimer = null;
     state.me = null;
+    state.webrtcConfig = { ice_servers: [] };
     state.callLogsPage = 1;
     state.callLogsTotal = 0;
     state.callLogsTotalPages = 1;

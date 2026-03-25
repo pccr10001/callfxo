@@ -55,6 +55,7 @@ data class LoginResponse(
   @SerialName("refresh_token") val refreshToken: String = "",
   @SerialName("device_token") val deviceToken: String = "",
   @SerialName("push_config") val pushConfig: PushConfigData? = null,
+  @SerialName("webrtc_config") val webRTCConfig: WebRTCConfigData? = null,
 )
 
 @Serializable
@@ -62,6 +63,7 @@ data class MeResponse(
   val authenticated: Boolean = false,
   val user: UserDto? = null,
   @SerialName("device_token") val deviceToken: String = "",
+  @SerialName("webrtc_config") val webRTCConfig: WebRTCConfigData? = null,
 )
 
 @Serializable
@@ -174,6 +176,7 @@ class ApiClient(private val sessionStore: SessionStore) {
         deviceToken = if (login.deviceToken.isBlank()) deviceToken else login.deviceToken,
       )
       login.pushConfig?.let(sessionStore::savePushConfig)
+      login.webRTCConfig?.let(sessionStore::saveWebRTCConfig)
       user
     }
   }
@@ -209,6 +212,7 @@ class ApiClient(private val sessionStore: SessionStore) {
         deviceToken = if (resp.deviceToken.isBlank()) current.deviceToken else resp.deviceToken,
       )
       resp.pushConfig?.let(sessionStore::savePushConfig)
+      resp.webRTCConfig?.let(sessionStore::saveWebRTCConfig)
     }
   }
 
@@ -217,7 +221,9 @@ class ApiClient(private val sessionStore: SessionStore) {
   }
 
   suspend fun me(): Result<MeResponse> = authedGet("/api/me") { body ->
-    json.decodeFromString(MeResponse.serializer(), body)
+    json.decodeFromString(MeResponse.serializer(), body).also { resp ->
+      resp.webRTCConfig?.let(sessionStore::saveWebRTCConfig)
+    }
   }
 
   suspend fun logout(): Result<Unit> = runCatching {

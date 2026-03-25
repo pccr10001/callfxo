@@ -1,0 +1,36 @@
+services:
+  coturn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: coturn
+    restart: unless-stopped
+    environment:
+      SHARED_SECRET: "${SHARED_SECRET:?set SHARED_SECRET}"
+      EXTERNAL_IP: "${EXTERNAL_IP:?set EXTERNAL_IP}"
+      EXTERNAL_PORT: "${EXTERNAL_PORT:-3478}"
+      TLS_PORT: "${TLS_PORT:-5349}"
+      TCP_PORT: "${TCP_PORT:-3478}"
+      REALM: "${REALM:-callfxo.local}"
+      TLS_HOST: "${TLS_HOST:-}"
+      CERTBOT_ENABLED: "${CERTBOT_ENABLED:-false}"
+      CERTBOT_EMAIL: "${CERTBOT_EMAIL:-}"
+      CERTBOT_RENEW_SCHEDULE: "${CERTBOT_RENEW_SCHEDULE:-17 3 * * *}"
+      RELAY_MIN_PORT: "${RELAY_MIN_PORT:-49160}"
+      RELAY_MAX_PORT: "${RELAY_MAX_PORT:-49200}"
+    ports:
+      - "80:80/tcp"
+      - "${EXTERNAL_PORT:-3478}:${EXTERNAL_PORT:-3478}/udp"
+      - "${TCP_PORT:-3478}:${EXTERNAL_PORT:-3478}/tcp"
+      - "${TLS_PORT:-5349}:${TLS_PORT:-5349}/tcp"
+      - "${RELAY_MIN_PORT:-49160}-${RELAY_MAX_PORT:-49200}:${RELAY_MIN_PORT:-49160}-${RELAY_MAX_PORT:-49200}/udp"
+    volumes:
+      - coturn-app:/app
+      - coturn-letsencrypt:/etc/letsencrypt
+      - coturn-letsencrypt-lib:/var/lib/letsencrypt
+    stop_grace_period: 20s
+
+volumes:
+  coturn-app:
+  coturn-letsencrypt:
+  coturn-letsencrypt-lib:
