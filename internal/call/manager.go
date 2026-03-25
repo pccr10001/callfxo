@@ -2,7 +2,10 @@ package call
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -555,7 +558,16 @@ func (m *Manager) createWebRTCSide(offerSDP string, cb SignalCallbacks, callLogI
 
 	iceServers := make([]webrtc.ICEServer, 0, 1)
 	if len(m.cfg.ICESTUNURLs) > 0 {
-		iceServers = append(iceServers, webrtc.ICEServer{URLs: m.cfg.ICESTUNURLs})
+		iceServers = append(iceServers, webrtc.ICEServer{URLs: trimNonBlankICEURLs(m.cfg.ICESTUNURLs)})
+	}
+	turnURLs := trimNonBlankICEURLs(m.cfg.ICETURNURLs)
+	if len(turnURLs) > 0 {
+		username, credential := m.turnCredentials("callfxo-server")
+		iceServers = append(iceServers, webrtc.ICEServer{
+			URLs:       turnURLs,
+			Username:   username,
+			Credential: credential,
+		})
 	}
 	pc, err := m.api.NewPeerConnection(webrtc.Configuration{ICEServers: iceServers})
 	if err != nil {
@@ -913,6 +925,47 @@ func drainRTCP(sender *webrtc.RTPSender) {
 			return
 		}
 	}
+}
+
+func (m *Manager) turnCredentials(subject string) (string, string) {
+	sharedSecret := strings.TrimSpace(m.cfg.ICETURNSharedSecret)
+	if sharedSecret != "" {
+		ttl := time.Duration(m.cfg.ICETURNCredentialTTLMinute) * time.Minute
+		if ttl <= 0 {
+			ttl = time.Duration(config.Default().Media.ICETURNCredentialTTLMinute) * time.Minute
+		}
+		return buildTURNCredentials(sharedSecret, normalizeTurnSubject(subject), ttl)
+	}
+	return strings.TrimSpace(m.cfg.ICETURNUsername), strings.TrimSpace(m.cfg.ICETURNCredential)
+}
+
+func buildTURNCredentials(secret, subject string, ttl time.Duration) (string, string) {
+	exp := time.Now().Add(ttl).Unix()
+	username := fmt.Sprintf("%d:%s", exp, subject)
+	mac := hmac.New(sha1.New, []byte(secret))
+	_, _ = mac.Write([]byte(username))
+	credential := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	return username, credential
+}
+
+func normalizeTurnSubject(subject string) string {
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return "callfxo"
+	}
+	return strings.ReplaceAll(subject, ":", "_")
+}
+
+func trimNonBlankICEURLs(items []string) []string {
+	out := make([]string, 0, len(items))
+	for _, raw := range items {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
 }
 
 func newID() string {
